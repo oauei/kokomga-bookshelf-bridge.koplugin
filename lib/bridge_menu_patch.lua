@@ -213,6 +213,49 @@ function M.patchKokomgaMenu(profiles_mod)
                                 profiles_mod.showNetworkProfilesDialog()
                             end,
                         })
+                        table.insert(sub_items, 2, {
+                            text_func = function()
+                                local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
+                                local count = (ok_sq and SyncQueue and SyncQueue.count) and SyncQueue.count() or 0
+                                if count > 0 then
+                                    return string.format(_("Offline Sync Queue (%d pending)"), count)
+                                else
+                                    return _("Offline Sync Queue (empty)")
+                                end
+                            end,
+                            help_text = _("Pushes buffered offline reading progress and finished book actions to the Komga server."),
+                            keep_menu_open = true,
+                            callback = function(touchmenu_instance)
+                                local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
+                                if ok_sq and SyncQueue then
+                                    local count = SyncQueue.count()
+                                    if count == 0 then
+                                        UIManager:show(Notification:new{ text = _("Offline sync queue is empty.") })
+                                        return
+                                    end
+                                    local ok_h, Health = pcall(require, "lib/bridge_health")
+                                    local reachable, reason = true, nil
+                                    if ok_h and Health and Health.isServerReachable then
+                                        reachable, reason = Health.isServerReachable()
+                                    end
+                                    if not reachable then
+                                        UIManager:show(Notification:new{ text = _("Server unreachable. Actions will sync automatically when reconnected.") })
+                                        return
+                                    end
+                                    UIManager:show(Notification:new{ text = string.format(_("Syncing %d pending action(s)..."), count) })
+                                    SyncQueue.flush(self_m.plugin and self_m.plugin.api, function(success, res)
+                                        if success then
+                                            UIManager:show(Notification:new{ text = string.format(_("Successfully synced %s actions to Komga."), tostring(res)) })
+                                        else
+                                            UIManager:show(Notification:new{ text = string.format(_("Sync paused: %s"), tostring(res)) })
+                                        end
+                                        if touchmenu_instance and touchmenu_instance.updateItems then
+                                            touchmenu_instance:updateItems()
+                                        end
+                                    end)
+                                end
+                            end,
+                        })
                         return sub_items
                     end
                     found = true
@@ -679,29 +722,43 @@ function M.handleAutoRtlAdvanced(ui)
     local filepath = document.file
     local is_manga = isMangaDocument(document, filepath)
 
-    if is_manga then
-        if not ui.view.inverse_reading_order then
-            logger.info("[Bridge] Auto-RTL Advanced: setting Manga to RTL reading order")
-            ui.view.inverse_reading_order = true
-            if ui.doc_settings then
-                pcall(function() ui.doc_settings:saveSetting("inverse_reading_order", true) end)
-                pcall(function() ui.doc_settings:flush() end)
+    local target_order = is_manga and true or false
+    local order_changed = false
+
+    if ui.view.inverse_reading_order ~= target_order then
+        logger.info(string.format("[Bridge] Auto-RTL Advanced: setting %s to %s reading order",
+            is_manga and "Manga" or "Light Novel",
+            target_order and "RTL" or "LTR"
+        ))
+        if type(ui.view.onToggleReadingOrder) == "function" then
+            ui.view:onToggleReadingOrder(target_order)
+        else
+            ui.view.inverse_reading_order = target_order
+            if type(ui.view.setupTouchZones) == "function" then
+                ui.view:setupTouchZones()
+            elseif ui.rolling and type(ui.rolling.setupTouchZones) == "function" then
+                ui.rolling:setupTouchZones()
+            elseif ui.paging and type(ui.paging.setupTouchZones) == "function" then
+                ui.paging:setupTouchZones()
             end
-            return true
         end
-    else
-        -- Light Novel / EPUB / reflowable / text PDF: ALWAYS ensure LTR (inverse_reading_order = false)
-        if ui.view.inverse_reading_order then
-            logger.info("[Bridge] Auto-RTL Advanced: reverting Light Novel to LTR reading order")
-            ui.view.inverse_reading_order = false
-            if ui.doc_settings then
-                pcall(function() ui.doc_settings:saveSetting("inverse_reading_order", false) end)
-                pcall(function() ui.doc_settings:flush() end)
-            end
-            return true
+        if ui.doc_settings then
+            pcall(function() ui.doc_settings:saveSetting("inverse_reading_order", target_order) end)
+            pcall(function() ui.doc_settings:flush() end)
         end
+        order_changed = true
     end
-    return false
+
+    -- Always ensure touch zones are synchronized with current inverse_reading_order
+    if type(ui.view.setupTouchZones) == "function" then
+        ui.view:setupTouchZones()
+    elseif ui.rolling and type(ui.rolling.setupTouchZones) == "function" then
+        ui.rolling:setupTouchZones()
+    elseif ui.paging and type(ui.paging.setupTouchZones) == "function" then
+        ui.paging:setupTouchZones()
+    end
+
+    return order_changed
 end
 
 local function hookOnReaderReady(proto)
@@ -733,13 +790,21 @@ local function hookOnReaderReady(proto)
             M.handleAutoRtlAdvanced(self_k.ui)
         end
 
+        local ok_h, Health = pcall(require, "lib/bridge_health")
+        if ok_h and Health and Health.isServerReachable and Health.isServerReachable() then
+            local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
+            if ok_sq and SyncQueue and SyncQueue.hasPending and SyncQueue.hasPending() then
+                SyncQueue.flush(self_k.api)
+            end
+        end
+
         if not ok then
             logger.warn("[Bridge] Error in patched Kokomga onReaderReady:", tostring(res))
             return nil
         end
         return res
     end
-    logger.info("[Bridge] Patched KokomgaPlugin:onReaderReady for Auto-RTL Advanced support")
+    logger.info("[Bridge] Patched KokomgaPlugin:onReaderReady for Auto-RTL Advanced and sync queue flush")
 end
 
 local function hookScreensaverCover(proto)
@@ -843,7 +908,23 @@ local function patchSyncTarget(sync_target)
         sync_target.promptNextChapter = function(self_s, ui, show_native_func)
             local reachable, reason = Health.isServerReachable()
             if not reachable then
-                logger.info("[Bridge] Komga server unreachable (" .. tostring(reason) .. "), fast-skipping promptNextChapter")
+                logger.info("[Bridge] Komga server unreachable (" .. tostring(reason) .. "), fast-skipping promptNextChapter and saving completion offline")
+                if ui and ui.doc_settings then
+                    local summary = ui.doc_settings:readSetting("summary") or {}
+                    summary.status = "complete"
+                    summary.modified = os.date("%Y-%m-%d", os.time())
+                    ui.doc_settings:saveSetting("summary", summary)
+                    pcall(function() ui.doc_settings:flush() end)
+                end
+                if ui and ui.document and ui.document.file then
+                    pcall(function()
+                        local BookList = require("ui/widget/booklist")
+                        if BookList and BookList.setBookInfoCacheProperty then
+                            BookList.setBookInfoCacheProperty(ui.document.file, "status", "complete")
+                        end
+                    end)
+                end
+                pcall(self_s.pushProgressForDocument, self_s, ui, true)
                 if show_native_func then
                     show_native_func()
                     return true
@@ -927,7 +1008,123 @@ local function patchSyncTarget(sync_target)
         end
     end
 
-    logger.info("[Bridge] Patched KomgaSync with ANR offline protection")
+    -- 6. pushProgressForDocument
+    if sync_target.pushProgressForDocument then
+        local orig_push_doc = sync_target.pushProgressForDocument
+        sync_target.pushProgressForDocument = function(self_s, ui, is_quiet, ensure_networking)
+            local SyncQueue = require("lib/bridge_sync_queue")
+            local ok_nm, NetworkMgr = pcall(require, "ui/network/manager")
+            local is_offline = ok_nm and NetworkMgr and (not NetworkMgr:isOnline())
+            local reachable, reason = Health.isServerReachable()
+            local cb_active = (self_s.isCircuitBreakerActive and self_s:isCircuitBreakerActive())
+
+            if is_offline or not reachable or cb_active then
+                if ui and ui.document then
+                    local filepath = ui.document.file
+                    local book_id = filepath and self_s.getOrMatchBook and self_s:getOrMatchBook(filepath)
+                    if book_id then
+                        local current_page = ui.view and ui.view.state and ui.view.state.page or 1
+                        local total_pages = ui.view and ui.view.state and ui.view.state.page_count
+                            or (ui.document and ui.document.getPageCount and ui.document:getPageCount())
+                            or current_page
+                        local is_completed = (total_pages and total_pages > 0 and current_page >= total_pages)
+                        if ui.doc_settings then
+                            local summary = ui.doc_settings:readSetting("summary")
+                            if summary and type(summary) == "table" and summary.status == "complete" then
+                                is_completed = true
+                            end
+                            local lpct = tonumber(ui.doc_settings:readSetting("percent_finished"))
+                            if lpct and lpct >= 0.99 then
+                                is_completed = true
+                            end
+                        end
+                        SyncQueue.enqueue("progress", book_id, {
+                            page = current_page,
+                            total_pages = total_pages,
+                            completed = is_completed,
+                            filepath = filepath,
+                        })
+                        logger.info(string.format("[Bridge] Offline/unreachable: buffered pushProgressForDocument for book %s (page %d/%d, completed=%s)",
+                            tostring(book_id), current_page, total_pages, tostring(is_completed)))
+                    end
+                end
+                return
+            end
+
+            -- Server is reachable: flush any pending offline queue items in background
+            if SyncQueue.hasPending() and self_s.plugin and self_s.plugin.api then
+                SyncQueue.flush(self_s.plugin.api)
+            end
+
+            return orig_push_doc(self_s, ui, is_quiet, ensure_networking)
+        end
+    end
+
+    -- 7. pushProgress
+    if sync_target.pushProgress then
+        local orig_push = sync_target.pushProgress
+        sync_target.pushProgress = function(self_s, book_id, current_page, total_pages, is_quiet)
+            local SyncQueue = require("lib/bridge_sync_queue")
+            local ok_nm, NetworkMgr = pcall(require, "ui/network/manager")
+            local is_offline = ok_nm and NetworkMgr and (not NetworkMgr:isOnline())
+            local reachable, reason = Health.isServerReachable()
+            local cb_active = (self_s.isCircuitBreakerActive and self_s:isCircuitBreakerActive())
+
+            if is_offline or not reachable or cb_active then
+                local completed = (total_pages and total_pages > 0 and current_page >= total_pages)
+                SyncQueue.enqueue("progress", book_id, {
+                    page = current_page,
+                    total_pages = total_pages,
+                    completed = completed,
+                })
+                logger.info(string.format("[Bridge] Offline/unreachable: buffered pushProgress for book %s (page %d/%s, completed=%s)",
+                    tostring(book_id), current_page, tostring(total_pages), tostring(completed)))
+                return
+            end
+
+            return orig_push(self_s, book_id, current_page, total_pages, is_quiet)
+        end
+    end
+
+    -- 8. collectBgDownloads
+    if sync_target.collectBgDownloads then
+        local orig_collect = sync_target.collectBgDownloads
+        sync_target.collectBgDownloads = function(self_s)
+            local pushes_before = {}
+            if self_s.bg_processes then
+                for _, proc in ipairs(self_s.bg_processes) do
+                    if proc.is_push and proc.book_id then
+                        pushes_before[proc.pid] = {
+                            book_id = proc.book_id,
+                            page = proc.page,
+                            start_time = proc.start_time,
+                        }
+                    end
+                end
+            end
+
+            orig_collect(self_s)
+
+            -- If circuit breaker tripped during collect, enqueue any removed pushes
+            if self_s.isCircuitBreakerActive and self_s:isCircuitBreakerActive() then
+                local remaining_pids = {}
+                if self_s.bg_processes then
+                    for _, proc in ipairs(self_s.bg_processes) do
+                        remaining_pids[proc.pid] = true
+                    end
+                end
+                for pid, info in pairs(pushes_before) do
+                    if not remaining_pids[pid] then
+                        local SyncQueue = require("lib/bridge_sync_queue")
+                        SyncQueue.enqueue("progress", info.book_id, { page = info.page })
+                        logger.info(string.format("[Bridge] Enqueued failed push for book %s after circuit breaker trip", tostring(info.book_id)))
+                    end
+                end
+            end
+        end
+    end
+
+    logger.info("[Bridge] Patched KomgaSync with ANR offline protection and offline sync queue")
 end
 
 local function hookOnNetworkConnected(target)
@@ -938,6 +1135,13 @@ local function hookOnNetworkConnected(target)
     target.onNetworkConnected = function(self_k, ...)
         local Health = require("lib/bridge_health")
         Health.resetCircuitBreaker()
+        local SyncQueue = require("lib/bridge_sync_queue")
+        local api = self_k.api or (self_k.getKomgaPlugin and self_k.getKomgaPlugin() and self_k.getKomgaPlugin().api)
+        if api then
+            SyncQueue.flush(api)
+        else
+            SyncQueue.flush()
+        end
         if orig_net then
             return orig_net(self_k, ...)
         end
