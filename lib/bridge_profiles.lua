@@ -280,14 +280,22 @@ function M.switchServerAddress(new_base_url, profile_name)
         Health.resetCircuitBreaker()
     end
 
-    -- 5. Notify Bookshelf if running
+    -- 5. Notify Bookshelf if running (deferred via nextTick to avoid destroying widget tree during event dispatch)
     local ok_bw, BookshelfWidget = pcall(require, "lib/bookshelf_widget")
     if ok_bw and BookshelfWidget and BookshelfWidget.live then
-        pcall(function()
-            if BookshelfWidget.live._rebuild then
-                BookshelfWidget.live:_rebuild()
+        local bw = BookshelfWidget.live
+        UIManager:nextTick(function()
+            local ok_rb, rb_err = pcall(function()
+                if bw and bw._rebuild then
+                    bw:_rebuild()
+                end
+                if UIManager and UIManager.setDirty then
+                    UIManager:setDirty(bw, "ui")
+                end
+            end)
+            if not ok_rb then
+                logger.warn("[Bridge] Deferred Bookshelf rebuild after profile switch failed:", tostring(rb_err))
             end
-            UIManager:setDirty(BookshelfWidget.live, "ui")
         end)
     end
 
@@ -317,42 +325,46 @@ function M.promptAddProfile(on_saved)
                         UIManager:close(dialog)
                         if not name or name:gsub("%s+", "") == "" then return end
 
-                        local url_dialog = nil
-                        url_dialog = InputDialog:new{
-                            title = _("Server Base URL"),
-                            input = "http://",
-                            input_type = "string",
-                            hint = "http://192.168.1.100:25600",
-                            buttons = {
-                                {
+                        UIManager:nextTick(function()
+                            local url_dialog = nil
+                            url_dialog = InputDialog:new{
+                                title = _("Server Base URL"),
+                                input = "http://",
+                                input_type = "string",
+                                hint = "http://192.168.1.100:25600",
+                                buttons = {
                                     {
-                                        text = _("Cancel"),
-                                        id = "cancel",
-                                        callback = function() UIManager:close(url_dialog) end,
-                                    },
-                                    {
-                                        text = _("Save"),
-                                        is_enter_default = true,
-                                        callback = function()
-                                            local raw_url = url_dialog:getInputText()
-                                            local clean_url = M.normalizeBaseUrl(raw_url)
-                                            UIManager:close(url_dialog)
-                                            if clean_url ~= "" then
-                                                local profiles = M.getProfiles()
-                                                profiles[#profiles + 1] = {
-                                                    name = name,
-                                                    base_url = clean_url,
-                                                    active = false,
-                                                }
-                                                M.saveProfiles(profiles)
-                                                if on_saved then on_saved() end
-                                            end
-                                        end,
+                                        {
+                                            text = _("Cancel"),
+                                            id = "cancel",
+                                            callback = function() UIManager:close(url_dialog) end,
+                                        },
+                                        {
+                                            text = _("Save"),
+                                            is_enter_default = true,
+                                            callback = function()
+                                                local raw_url = url_dialog:getInputText()
+                                                local clean_url = M.normalizeBaseUrl(raw_url)
+                                                UIManager:close(url_dialog)
+                                                if clean_url ~= "" then
+                                                    local profiles = M.getProfiles()
+                                                    profiles[#profiles + 1] = {
+                                                        name = name,
+                                                        base_url = clean_url,
+                                                        active = false,
+                                                    }
+                                                    M.saveProfiles(profiles)
+                                                    if on_saved then
+                                                        UIManager:nextTick(on_saved)
+                                                    end
+                                                end
+                                            end,
+                                        },
                                     },
                                 },
-                            },
-                        }
-                        UIManager:show(url_dialog)
+                            }
+                            UIManager:show(url_dialog)
+                        end)
                     end,
                 },
             },
@@ -375,30 +387,34 @@ function M.promptEditProfile(idx, on_saved)
                     text = _("Edit Name"),
                     callback = function()
                         UIManager:close(dialog)
-                        local inp = nil
-                        inp = InputDialog:new{
-                            title = _("Edit Profile Name"),
-                            input = p.name,
-                            buttons = {
-                                {
-                                    { text = _("Cancel"), callback = function() UIManager:close(inp) end },
+                        UIManager:nextTick(function()
+                            local inp = nil
+                            inp = InputDialog:new{
+                                title = _("Edit Profile Name"),
+                                input = p.name,
+                                buttons = {
                                     {
-                                        text = _("Save"),
-                                        is_enter_default = true,
-                                        callback = function()
-                                            local n = inp:getInputText()
-                                            UIManager:close(inp)
-                                            if n and n:gsub("%s+", "") ~= "" then
-                                                p.name = n
-                                                M.saveProfiles(profiles)
-                                                if on_saved then on_saved() end
-                                            end
-                                        end,
+                                        { text = _("Cancel"), callback = function() UIManager:close(inp) end },
+                                        {
+                                            text = _("Save"),
+                                            is_enter_default = true,
+                                            callback = function()
+                                                local n = inp:getInputText()
+                                                UIManager:close(inp)
+                                                if n and n:gsub("%s+", "") ~= "" then
+                                                    p.name = n
+                                                    M.saveProfiles(profiles)
+                                                    if on_saved then
+                                                        UIManager:nextTick(on_saved)
+                                                    end
+                                                end
+                                            end,
+                                        },
                                     },
                                 },
-                            },
-                        }
-                        UIManager:show(inp)
+                            }
+                            UIManager:show(inp)
+                        end)
                     end,
                 },
             },
@@ -407,30 +423,34 @@ function M.promptEditProfile(idx, on_saved)
                     text = _("Edit Base URL"),
                     callback = function()
                         UIManager:close(dialog)
-                        local inp = nil
-                        inp = InputDialog:new{
-                            title = _("Edit Server Base URL"),
-                            input = p.base_url,
-                            buttons = {
-                                {
-                                    { text = _("Cancel"), callback = function() UIManager:close(inp) end },
+                        UIManager:nextTick(function()
+                            local inp = nil
+                            inp = InputDialog:new{
+                                title = _("Edit Server Base URL"),
+                                input = p.base_url,
+                                buttons = {
                                     {
-                                        text = _("Save"),
-                                        is_enter_default = true,
-                                        callback = function()
-                                            local u = M.normalizeBaseUrl(inp:getInputText())
-                                            UIManager:close(inp)
-                                            if u ~= "" then
-                                                p.base_url = u
-                                                M.saveProfiles(profiles)
-                                                if on_saved then on_saved() end
-                                            end
-                                        end,
+                                        { text = _("Cancel"), callback = function() UIManager:close(inp) end },
+                                        {
+                                            text = _("Save"),
+                                            is_enter_default = true,
+                                            callback = function()
+                                                local u = M.normalizeBaseUrl(inp:getInputText())
+                                                UIManager:close(inp)
+                                                if u ~= "" then
+                                                    p.base_url = u
+                                                    M.saveProfiles(profiles)
+                                                    if on_saved then
+                                                        UIManager:nextTick(on_saved)
+                                                    end
+                                                end
+                                            end,
+                                        },
                                     },
                                 },
-                            },
-                        }
-                        UIManager:show(inp)
+                            }
+                            UIManager:show(inp)
+                        end)
                     end,
                 },
             },
@@ -439,15 +459,19 @@ function M.promptEditProfile(idx, on_saved)
                     text = _("Delete Profile"),
                     callback = function()
                         UIManager:close(dialog)
-                        UIManager:show(ConfirmBox:new{
-                            text = _("Delete this profile?"),
-                            ok_text = _("Delete"),
-                            ok_callback = function()
-                                table.remove(profiles, idx)
-                                M.saveProfiles(profiles)
-                                if on_saved then on_saved() end
-                            end,
-                        })
+                        UIManager:nextTick(function()
+                            UIManager:show(ConfirmBox:new{
+                                text = _("Delete this profile?"),
+                                ok_text = _("Delete"),
+                                ok_callback = function()
+                                    table.remove(profiles, idx)
+                                    M.saveProfiles(profiles)
+                                    if on_saved then
+                                        UIManager:nextTick(on_saved)
+                                    end
+                                end,
+                            })
+                        end)
                     end,
                 },
             },
@@ -456,7 +480,9 @@ function M.promptEditProfile(idx, on_saved)
                     text = _("Back"),
                     callback = function()
                         UIManager:close(dialog)
-                        if on_saved then on_saved() end
+                        if on_saved then
+                            UIManager:nextTick(on_saved)
+                        end
                     end,
                 },
             },
@@ -475,8 +501,10 @@ function M.promptManageProfiles(on_saved)
             text = _("+ Add Profile…"),
             callback = function()
                 UIManager:close(dialog)
-                M.promptAddProfile(function()
-                    M.promptManageProfiles(on_saved)
+                UIManager:nextTick(function()
+                    M.promptAddProfile(function()
+                        M.promptManageProfiles(on_saved)
+                    end)
                 end)
             end,
         },
@@ -490,8 +518,10 @@ function M.promptManageProfiles(on_saved)
                 text = label,
                 callback = function()
                     UIManager:close(dialog)
-                    M.promptEditProfile(idx, function()
-                        M.promptManageProfiles(on_saved)
+                    UIManager:nextTick(function()
+                        M.promptEditProfile(idx, function()
+                            M.promptManageProfiles(on_saved)
+                        end)
                     end)
                 end,
             },
@@ -503,7 +533,9 @@ function M.promptManageProfiles(on_saved)
             text = _("Done"),
             callback = function()
                 UIManager:close(dialog)
-                if on_saved then on_saved() end
+                if on_saved then
+                    UIManager:nextTick(on_saved)
+                end
             end,
         },
     }
@@ -521,7 +553,7 @@ function M.showNetworkProfilesDialog(on_complete)
     local buttons = {}
     local dialog = nil
 
-    for _, p in ipairs(profiles) do
+    for p_idx, p in ipairs(profiles) do
         local label = (p.active and "✓ " or "") .. p.name .. "\n" .. p.base_url
         local target_url = p.base_url
         local target_name = p.name
@@ -530,12 +562,21 @@ function M.showNetworkProfilesDialog(on_complete)
                 text = label,
                 callback = function()
                     UIManager:close(dialog)
-                    M.switchServerAddress(target_url, target_name)
-                    UIManager:show(Notification:new{
-                        text = _("Switched Komga server to: ") .. target_name,
-                        timeout = 3,
-                    })
-                    if on_complete then on_complete() end
+                    UIManager:nextTick(function()
+                        local ok_sw, sw_err = pcall(function()
+                            M.switchServerAddress(target_url, target_name)
+                        end)
+                        if not ok_sw then
+                            logger.error("[Bridge Profiles] Error switching server address:", tostring(sw_err))
+                        end
+                        UIManager:show(Notification:new{
+                            text = _("Switched Komga server to: ") .. target_name,
+                            timeout = 3,
+                        })
+                        if on_complete then
+                            pcall(on_complete)
+                        end
+                    end)
                 end,
             },
         }
@@ -546,8 +587,10 @@ function M.showNetworkProfilesDialog(on_complete)
             text = _("Manage Profiles…"),
             callback = function()
                 UIManager:close(dialog)
-                M.promptManageProfiles(function()
-                    M.showNetworkProfilesDialog(on_complete)
+                UIManager:nextTick(function()
+                    M.promptManageProfiles(function()
+                        M.showNetworkProfilesDialog(on_complete)
+                    end)
                 end)
             end,
         },
@@ -558,7 +601,9 @@ function M.showNetworkProfilesDialog(on_complete)
             text = _("Cancel"),
             callback = function()
                 UIManager:close(dialog)
-                if on_complete then on_complete() end
+                if on_complete then
+                    pcall(on_complete)
+                end
             end,
         },
     }
