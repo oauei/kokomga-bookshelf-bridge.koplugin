@@ -30,8 +30,8 @@ Key features include:
 ## Dependencies
 
 - [KOReader](https://github.com/koreader/koreader): Document viewer for e-ink devices and Android.
-- [Kokomga](https://github.com/zenf/kokomga): Komga client plugin for KOReader.
-- [Bookshelf](https://github.com/koreader/koreader): Visual bookshelf plugin for KOReader.
+- [Kokomga](https://github.com/JimDBh/kokomga.koplugin): Komga client plugin for KOReader.
+- [Bookshelf](https://github.com/AndyHazz/bookshelf.koplugin): Visual bookshelf plugin for KOReader.
 
 ### Related Plugins
 
