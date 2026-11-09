@@ -299,10 +299,38 @@ function M.patchKokomgaMenu(profiles_mod)
                             end,
                         }
 
+                        local defer_item = {
+                            text = _("Defer reading progress sync (idle/close only)"),
+                            help_text = _("Prevents page-turn latency by debouncing Komga progress updates until 5 seconds of reading inactivity or document close."),
+                            checked_func = function()
+                                if G_reader_settings and G_reader_settings:has("bridge_defer_progress_sync") then
+                                    return G_reader_settings:isTrue("bridge_defer_progress_sync")
+                                end
+                                return true
+                            end,
+                            keep_menu_open = true,
+                            callback = function(touchmenu_instance)
+                                local curr = true
+                                if G_reader_settings and G_reader_settings:has("bridge_defer_progress_sync") then
+                                    curr = G_reader_settings:isTrue("bridge_defer_progress_sync")
+                                end
+                                local new_val = not curr
+                                if G_reader_settings then
+                                    G_reader_settings:saveSetting("bridge_defer_progress_sync", new_val)
+                                    pcall(function() G_reader_settings:flush() end)
+                                end
+                                if touchmenu_instance and touchmenu_instance.updateItems then
+                                    touchmenu_instance:updateItems()
+                                end
+                            end,
+                        }
+
                         if rtl_idx then
                             table.insert(sub_items, rtl_idx + 1, adv_item)
+                            table.insert(sub_items, rtl_idx + 2, defer_item)
                         else
                             table.insert(sub_items, adv_item)
+                            table.insert(sub_items, defer_item)
                         end
                         return sub_items
                     end
@@ -1011,7 +1039,60 @@ local function patchSyncTarget(sync_target)
     -- 6. pushProgressForDocument
     if sync_target.pushProgressForDocument then
         local orig_push_doc = sync_target.pushProgressForDocument
+        sync_target.flushDebouncedProgress = function(self_s)
+            if self_s._debounced_progress_timer then
+                UIManager:unschedule(self_s._debounced_progress_timer)
+                self_s._debounced_progress_timer = nil
+            end
+            if self_s._pending_push_ui then
+                local p_ui = self_s._pending_push_ui
+                local p_net = self_s._pending_ensure_networking
+                self_s._pending_push_ui = nil
+                self_s._pending_ensure_networking = nil
+                logger.info("[Bridge] Explicit flush of debounced reading progress")
+                pcall(sync_target.pushProgressForDocument, self_s, p_ui, false, p_net)
+            end
+        end
+
         sync_target.pushProgressForDocument = function(self_s, ui, is_quiet, ensure_networking)
+            local defer_enabled = true
+            if G_reader_settings and G_reader_settings:has("bridge_defer_progress_sync") then
+                defer_enabled = G_reader_settings:isTrue("bridge_defer_progress_sync")
+            end
+
+            -- When reading normally (is_quiet == true), debounce progress push to avoid page turn latency
+            if defer_enabled and is_quiet then
+                if self_s._debounced_progress_timer then
+                    UIManager:unschedule(self_s._debounced_progress_timer)
+                    self_s._debounced_progress_timer = nil
+                end
+
+                self_s._pending_push_ui = ui
+                self_s._pending_ensure_networking = ensure_networking
+
+                self_s._debounced_progress_timer = function()
+                    self_s._debounced_progress_timer = nil
+                    if self_s._pending_push_ui then
+                        local p_ui = self_s._pending_push_ui
+                        local p_net = self_s._pending_ensure_networking
+                        self_s._pending_push_ui = nil
+                        self_s._pending_ensure_networking = nil
+                        logger.info("[Bridge] Executing debounced pushProgressForDocument after 5s idle pause")
+                        pcall(sync_target.pushProgressForDocument, self_s, p_ui, false, p_net)
+                    end
+                end
+
+                UIManager:scheduleIn(5, self_s._debounced_progress_timer)
+                return
+            end
+
+            if self_s._debounced_progress_timer then
+                UIManager:unschedule(self_s._debounced_progress_timer)
+                self_s._debounced_progress_timer = nil
+            end
+            self_s._pending_push_ui = nil
+            self_s._pending_ensure_networking = nil
+
             local SyncQueue = require("lib/bridge_sync_queue")
             local ok_nm, NetworkMgr = pcall(require, "ui/network/manager")
             local is_offline = ok_nm and NetworkMgr and (not NetworkMgr:isOnline())
@@ -1148,6 +1229,21 @@ local function hookOnNetworkConnected(target)
     end
 end
 
+local function hookOnCloseDocument(target)
+    if not (target and type(target) == "table") then return end
+    if target._bridge_close_hooked then return end
+    target._bridge_close_hooked = true
+    local orig_close = target.onCloseDocument
+    target.onCloseDocument = function(self_k, ...)
+        if self_k.sync and self_k.sync.flushDebouncedProgress then
+            pcall(self_k.sync.flushDebouncedProgress, self_k.sync)
+        end
+        if orig_close then
+            return orig_close(self_k, ...)
+        end
+    end
+end
+
 function M.patchKokomgaSync()
     pcall(require, "plugins/kokomga.koplugin/core/sync")
     pcall(require, "core/sync")
@@ -1162,6 +1258,8 @@ function M.patchKokomgaSync()
     if komga then
         hookOnNetworkConnected(komga)
         hookOnNetworkConnected(getmetatable(komga))
+        hookOnCloseDocument(komga)
+        hookOnCloseDocument(getmetatable(komga))
         if komga.sync then
             patchSyncTarget(komga.sync)
             patchSyncTarget(getmetatable(komga.sync))
