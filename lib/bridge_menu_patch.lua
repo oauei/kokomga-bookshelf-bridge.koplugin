@@ -303,16 +303,18 @@ function M.patchKokomgaMenu(profiles_mod)
                             text = _("Defer reading progress sync (idle/close only)"),
                             help_text = _("Prevents page-turn latency by debouncing Komga progress updates until 5 seconds of reading inactivity or document close."),
                             checked_func = function()
-                                if G_reader_settings and G_reader_settings:has("bridge_defer_progress_sync") then
-                                    return G_reader_settings:isTrue("bridge_defer_progress_sync")
+                                if G_reader_settings and G_reader_settings.readSetting then
+                                    local val = G_reader_settings:readSetting("bridge_defer_progress_sync")
+                                    if val ~= nil then return val == true end
                                 end
                                 return true
                             end,
                             keep_menu_open = true,
                             callback = function(touchmenu_instance)
                                 local curr = true
-                                if G_reader_settings and G_reader_settings:has("bridge_defer_progress_sync") then
-                                    curr = G_reader_settings:isTrue("bridge_defer_progress_sync")
+                                if G_reader_settings and G_reader_settings.readSetting then
+                                    local val = G_reader_settings:readSetting("bridge_defer_progress_sync")
+                                    if val ~= nil then curr = (val == true) end
                                 end
                                 local new_val = not curr
                                 if G_reader_settings then
@@ -1056,8 +1058,9 @@ local function patchSyncTarget(sync_target)
 
         sync_target.pushProgressForDocument = function(self_s, ui, is_quiet, ensure_networking)
             local defer_enabled = true
-            if G_reader_settings and G_reader_settings:has("bridge_defer_progress_sync") then
-                defer_enabled = G_reader_settings:isTrue("bridge_defer_progress_sync")
+            if G_reader_settings and G_reader_settings.readSetting then
+                local val = G_reader_settings:readSetting("bridge_defer_progress_sync")
+                if val ~= nil then defer_enabled = (val == true) end
             end
 
             -- When reading normally (is_quiet == true), debounce progress push to avoid page turn latency
