@@ -1041,11 +1041,17 @@ local function patchSyncTarget(sync_target)
     -- 6. pushProgressForDocument
     if sync_target.pushProgressForDocument then
         local orig_push_doc = sync_target.pushProgressForDocument
-        sync_target.flushDebouncedProgress = function(self_s)
+        local function unscheduleDebounce(self_s)
             if self_s._debounced_progress_timer then
-                UIManager:unschedule(self_s._debounced_progress_timer)
+                if UIManager and UIManager.unschedule then
+                    pcall(UIManager.unschedule, UIManager, self_s._debounced_progress_timer)
+                end
                 self_s._debounced_progress_timer = nil
             end
+        end
+
+        sync_target.flushDebouncedProgress = function(self_s)
+            unscheduleDebounce(self_s)
             if self_s._pending_push_ui then
                 local p_ui = self_s._pending_push_ui
                 local p_net = self_s._pending_ensure_networking
@@ -1065,10 +1071,7 @@ local function patchSyncTarget(sync_target)
 
             -- When reading normally (is_quiet == true), debounce progress push to avoid page turn latency
             if defer_enabled and is_quiet then
-                if self_s._debounced_progress_timer then
-                    UIManager:unschedule(self_s._debounced_progress_timer)
-                    self_s._debounced_progress_timer = nil
-                end
+                unscheduleDebounce(self_s)
 
                 self_s._pending_push_ui = ui
                 self_s._pending_ensure_networking = ensure_networking
@@ -1085,14 +1088,15 @@ local function patchSyncTarget(sync_target)
                     end
                 end
 
-                UIManager:scheduleIn(5, self_s._debounced_progress_timer)
+                if UIManager and UIManager.scheduleIn then
+                    UIManager:scheduleIn(5, self_s._debounced_progress_timer)
+                else
+                    self_s._debounced_progress_timer()
+                end
                 return
             end
 
-            if self_s._debounced_progress_timer then
-                UIManager:unschedule(self_s._debounced_progress_timer)
-                self_s._debounced_progress_timer = nil
-            end
+            unscheduleDebounce(self_s)
             self_s._pending_push_ui = nil
             self_s._pending_ensure_networking = nil
 
