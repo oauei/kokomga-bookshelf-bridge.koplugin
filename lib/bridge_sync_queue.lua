@@ -104,22 +104,31 @@ function M.enqueue(action_type, book_id, data)
     return true
 end
 
-function M.remove(book_id)
-    local id = normalizeBookId(book_id)
-    if not id then return false end
-
+function M.removeMultiple(book_ids)
+    if not book_ids or #book_ids == 0 then return false end
     local s = getSettings()
     if not s then return false end
 
     local q = s:readSetting("queue") or {}
-    if q[id] then
-        q[id] = nil
+    local changed = false
+    for _, raw_id in ipairs(book_ids) do
+        local id = normalizeBookId(raw_id)
+        if id and q[id] then
+            q[id] = nil
+            changed = true
+            logger.info("[Bridge SyncQueue] Removed book " .. tostring(id) .. " from queue")
+        end
+    end
+    if changed then
         s:saveSetting("queue", q)
         s:flush()
-        logger.info("[Bridge SyncQueue] Removed book " .. tostring(id) .. " from queue")
         return true
     end
     return false
+end
+
+function M.remove(book_id)
+    return M.removeMultiple({ book_id })
 end
 
 function M.clear()
@@ -240,7 +249,9 @@ function M.flush(api, on_complete)
     local count = 0
     for _ in pairs(q) do count = count + 1 end
     if count == 0 then
-        if on_complete then on_complete(true, 0) end
+        local stats = { pushed = 0, pruned = 0, total = 0 }
+        setmetatable(stats, { __tostring = function() return "0" end })
+        if on_complete then on_complete(true, stats) end
         return true
     end
 
@@ -262,113 +273,51 @@ function M.flush(api, on_complete)
     end
 
     M._flushing = true
-    logger.info(string.format("[Bridge SyncQueue] Starting flush for %d pending items", count))
+    logger.info(string.format("[Bridge SyncQueue] Starting cooperative flush for %d pending items", count))
 
-    -- Check if we can run in a background subprocess via ffiutil
-    local ok_ffi, ffiutil = pcall(require, "ffi/util")
-    local ok_json, JSON = pcall(require, "json")
-    local can_fork = ok_ffi and ffiutil and ffiutil.runInSubProcess and ok_json and JSON
+    local actions_list = {}
+    for _, item in pairs(q) do
+        actions_list[#actions_list + 1] = item
+    end
 
-    if can_fork and not (ok_h and Health and Health.isInSubprocess and Health.isInSubprocess()) then
-        local actions_list = {}
-        for _, item in pairs(q) do
-            actions_list[#actions_list + 1] = item
-        end
+    local pushed_cnt = 0
+    local pruned_cnt = 0
+    local unreachable_encountered = false
+    local failure_reason = nil
 
-        local pid, parent_read_fd = ffiutil.runInSubProcess(function(pid, child_write_fd)
-            local results = { succeeded = {}, unreachable = false, error = nil }
-            for _, item in ipairs(actions_list) do
-                local server_book, s_err, s_unreachable = fetchServerBook(api, item.book_id)
-                if s_unreachable then
-                    results.unreachable = true
-                    results.error = tostring(s_err)
-                    break
-                end
+    local ok_ui, UIManager = pcall(require, "ui/uimanager")
+    local has_ui = (ok_ui and UIManager and UIManager.scheduleIn)
 
-                local server_further, reason = false, nil
-                if server_book and type(server_book) == "table" then
-                    server_further, reason = M.isServerFurther(server_book, item)
-                end
-
-                if server_further then
-                    logger.info(string.format("[Bridge SyncQueue] Server progress is further for book %s (%s). Dropping stale queued update.",
-                        tostring(item.book_id), tostring(reason)))
-                    results.succeeded[item.book_id] = true
-                else
-                    local success, err, is_unreachable
-                    if item.action == "delete" then
-                        success, err, is_unreachable = api:request("/api/v1/books/" .. tostring(item.book_id) .. "/read-progress", "DELETE", nil, { timeout = 3, total_timeout = 5 })
-                    else
-                        success, err, is_unreachable = api:patch_read_progress(item.book_id, item.page, item.completed, { timeout = 3, total_timeout = 5 })
-                    end
-
-                    if success then
-                        results.succeeded[item.book_id] = true
-                    else
-                        local err_str = tostring(err):lower()
-                        if is_unreachable or err_str:find("timeout") or err_str:find("unreachable") or err_str:find("refused") then
-                            results.unreachable = true
-                            results.error = tostring(err)
-                            break
-                        else
-                            -- Client error (e.g. 404 book deleted), consider handled to avoid infinite queue loop
-                            results.succeeded[item.book_id] = true
-                        end
-                    end
-                end
-            end
-            local out = JSON.encode(results)
-            ffiutil.writeToFD(child_write_fd, out, true)
-        end, true)
-
-        if pid then
-            local ok_ui, UIManager = pcall(require, "ui/uimanager")
-            local function check_proc()
-                if ffiutil.isSubProcessDone(pid) then
-                    local ret_str = ""
-                    if parent_read_fd then
-                        ret_str = ffiutil.readAllFromFD(parent_read_fd)
-                    end
-                    local ok, res = pcall(JSON.decode, ret_str)
-                    M._flushing = false
-
-                    local flushed_cnt = 0
-                    if ok and type(res) == "table" then
-                        if res.succeeded then
-                            for book_id in pairs(res.succeeded) do
-                                M.remove(book_id)
-                                flushed_cnt = flushed_cnt + 1
-                            end
-                        end
-                        if res.unreachable and ok_h and Health and Health.tripCircuitBreaker then
-                            Health.tripCircuitBreaker(res.error or "Server unreachable during flush")
-                        end
-                    end
-                    logger.info(string.format("[Bridge SyncQueue] Subprocess flush complete. Flushed %d items", flushed_cnt))
-                    if on_complete then on_complete(true, flushed_cnt) end
-                else
-                    if ok_ui and UIManager and UIManager.scheduleIn then
-                        UIManager:scheduleIn(0.5, check_proc)
-                    else
-                        M._flushing = false
-                    end
-                end
-            end
-
-            if ok_ui and UIManager and UIManager.scheduleIn then
-                UIManager:scheduleIn(0.5, check_proc)
+    local function finish_flush()
+        M._flushing = false
+        local stats = {
+            pushed = pushed_cnt,
+            pruned = pruned_cnt,
+            total = pushed_cnt + pruned_cnt,
+        }
+        setmetatable(stats, {
+            __tostring = function() return tostring(stats.total) end
+        })
+        logger.info(string.format("[Bridge SyncQueue] Cooperative flush finished. Pushed: %d, Pruned: %d, Remaining: %d",
+            pushed_cnt, pruned_cnt, M.count()))
+        if on_complete then
+            if unreachable_encountered then
+                on_complete(false, failure_reason or "Server unreachable", stats)
             else
-                M._flushing = false
+                on_complete(true, stats)
             end
-            return true
         end
     end
 
-    -- Synchronous fallback (used in headless tests or when subprocess fork is unavailable)
-    local flushed_cnt = 0
-    local unreachable_encountered = false
+    local function step(idx)
+        if unreachable_encountered or idx > #actions_list then
+            finish_flush()
+            return
+        end
 
-    for book_id, item in pairs(q) do
+        local item = actions_list[idx]
+        local book_id = item.book_id
+
         local server_book, s_err, s_unreachable = fetchServerBook(api, book_id)
         if s_unreachable then
             logger.warn("[Bridge SyncQueue] Flush interrupted by unreachable server during book check:", tostring(s_err))
@@ -376,7 +325,9 @@ function M.flush(api, on_complete)
                 Health.tripCircuitBreaker(s_err)
             end
             unreachable_encountered = true
-            break
+            failure_reason = tostring(s_err)
+            finish_flush()
+            return
         end
 
         local server_further, reason = false, nil
@@ -388,7 +339,7 @@ function M.flush(api, on_complete)
             logger.info(string.format("[Bridge SyncQueue] Server progress is further for book %s (%s). Dropping stale queued update.",
                 tostring(book_id), tostring(reason)))
             M.remove(book_id)
-            flushed_cnt = flushed_cnt + 1
+            pruned_cnt = pruned_cnt + 1
         else
             local success, err, is_unreachable
             if item.action == "delete" then
@@ -399,7 +350,7 @@ function M.flush(api, on_complete)
 
             if success then
                 M.remove(book_id)
-                flushed_cnt = flushed_cnt + 1
+                pushed_cnt = pushed_cnt + 1
                 logger.info(string.format("[Bridge SyncQueue] Flushed book %s (page=%s, completed=%s)",
                     tostring(book_id),
                     tostring(item.page),
@@ -413,20 +364,27 @@ function M.flush(api, on_complete)
                         Health.tripCircuitBreaker(err)
                     end
                     unreachable_encountered = true
-                    break
+                    failure_reason = tostring(err)
+                    finish_flush()
+                    return
                 else
-                    -- Client error (e.g. 404 book deleted), remove so it doesn't block the queue
+                    -- Client error (e.g. 404 book deleted), consider handled to avoid infinite queue loop
                     logger.warn(string.format("[Bridge SyncQueue] Dropping book %s from queue after client error: %s", tostring(book_id), tostring(err)))
                     M.remove(book_id)
+                    pruned_cnt = pruned_cnt + 1
                 end
             end
         end
+
+        if has_ui then
+            UIManager:scheduleIn(0.05, function() step(idx + 1) end)
+        else
+            step(idx + 1)
+        end
     end
 
-    M._flushing = false
-    logger.info(string.format("[Bridge SyncQueue] Synchronous flush finished. %d items sent, remaining=%d", flushed_cnt, M.count()))
-    if on_complete then on_complete(not unreachable_encountered, flushed_cnt) end
-    return not unreachable_encountered, flushed_cnt
+    step(1)
+    return true
 end
 
 return M

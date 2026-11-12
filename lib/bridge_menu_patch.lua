@@ -245,7 +245,17 @@ function M.patchKokomgaMenu(profiles_mod)
                                     UIManager:show(Notification:new{ text = string.format(_("Syncing %d pending action(s)..."), count) })
                                     SyncQueue.flush(self_m.plugin and self_m.plugin.api, function(success, res)
                                         if success then
-                                            UIManager:show(Notification:new{ text = string.format(_("Successfully synced %s actions to Komga."), tostring(res)) })
+                                            if type(res) == "table" then
+                                                local pushed = res.pushed or 0
+                                                local pruned = res.pruned or 0
+                                                if pruned > 0 then
+                                                    UIManager:show(Notification:new{ text = string.format(_("Successfully synced %d action(s), pruned %d stale record(s)."), pushed, pruned) })
+                                                else
+                                                    UIManager:show(Notification:new{ text = string.format(_("Successfully synced %d action(s) to Komga."), pushed) })
+                                                end
+                                            else
+                                                UIManager:show(Notification:new{ text = string.format(_("Successfully synced %s actions to Komga."), tostring(res)) })
+                                            end
                                         else
                                             UIManager:show(Notification:new{ text = string.format(_("Sync paused: %s"), tostring(res)) })
                                         end
@@ -937,30 +947,72 @@ local function patchSyncTarget(sync_target)
         local orig_prompt = sync_target.promptNextChapter
         sync_target.promptNextChapter = function(self_s, ui, show_native_func)
             local reachable, reason = Health.isServerReachable()
-            if not reachable then
-                logger.info("[Bridge] Komga server unreachable (" .. tostring(reason) .. "), fast-skipping promptNextChapter and saving completion offline")
-                if ui and ui.doc_settings then
-                    local summary = ui.doc_settings:readSetting("summary") or {}
-                    summary.status = "complete"
-                    summary.modified = os.date("%Y-%m-%d", os.time())
-                    ui.doc_settings:saveSetting("summary", summary)
-                    pcall(function() ui.doc_settings:flush() end)
-                end
-                if ui and ui.document and ui.document.file then
-                    pcall(function()
-                        local BookList = require("ui/widget/booklist")
-                        if BookList and BookList.setBookInfoCacheProperty then
-                            BookList.setBookInfoCacheProperty(ui.document.file, "status", "complete")
-                        end
-                    end)
-                end
-                pcall(self_s.pushProgressForDocument, self_s, ui, true)
-                if show_native_func then
-                    show_native_func()
-                    return true
-                end
-                return false
+
+            -- 1. Always mark summary as complete in document settings and BookList cache
+            if ui and ui.doc_settings then
+                local summary = ui.doc_settings:readSetting("summary") or {}
+                summary.status = "complete"
+                summary.modified = os.date("%Y-%m-%d", os.time())
+                ui.doc_settings:saveSetting("summary", summary)
+                pcall(function() ui.doc_settings:flush() end)
             end
+            if ui and ui.document and ui.document.file then
+                pcall(function()
+                    local BookList = require("ui/widget/booklist")
+                    if BookList and BookList.setBookInfoCacheProperty then
+                        BookList.setBookInfoCacheProperty(ui.document.file, "status", "complete")
+                    end
+                end)
+            end
+
+            -- 2. Immediately enqueue completion in offline sync queue (never debounced)
+            local filepath = ui and ui.document and ui.document.file
+            local book_id = filepath and self_s.getOrMatchBook and self_s:getOrMatchBook(filepath)
+            if book_id then
+                local current_page = ui.view and ui.view.state and ui.view.state.page or 1
+                local total_pages = ui.view and ui.view.state and ui.view.state.page_count
+                    or (ui.document and ui.document.getPageCount and ui.document:getPageCount())
+                    or current_page
+                local SyncQueue = require("lib/bridge_sync_queue")
+                SyncQueue.enqueue("progress", book_id, {
+                    page = total_pages,
+                    total_pages = total_pages,
+                    completed = true,
+                    filepath = filepath,
+                })
+                logger.info(string.format("[Bridge] Immediate completion buffered for book %s (page %d/%d, completed=true)",
+                    tostring(book_id), total_pages, total_pages))
+            end
+
+            -- 3. Offline handling: allow Kokomga to check book_index without hanging on network
+            if not reachable then
+                logger.info("[Bridge] Komga server unreachable (" .. tostring(reason) .. "), running promptNextChapter in offline mode")
+                local orig_resolve = self_s.resolveNextBook
+                if orig_resolve then
+                    self_s.resolveNextBook = function(self_r, bid)
+                        local index = self_r.plugin and self_r.plugin.book_index
+                        local known = index and index.getNext(bid)
+                        if known then return known, "index" end
+                        return nil, known == false and "none" or "offline"
+                    end
+                end
+
+                local ok, ret = pcall(orig_prompt, self_s, ui, show_native_func)
+                if orig_resolve then
+                    self_s.resolveNextBook = orig_resolve
+                end
+
+                if not ok then
+                    logger.err("[Bridge] promptNextChapter offline error:", tostring(ret))
+                    if show_native_func then
+                        show_native_func()
+                        return true
+                    end
+                    return false
+                end
+                return ret
+            end
+
             local ok, ret = pcall(orig_prompt, self_s, ui, show_native_func)
             if not ok then
                 logger.err("[Bridge] promptNextChapter error:", tostring(ret))
@@ -1069,8 +1121,30 @@ local function patchSyncTarget(sync_target)
                 if val ~= nil then defer_enabled = (val == true) end
             end
 
-            -- When reading normally (is_quiet == true), debounce progress push to avoid page turn latency
-            if defer_enabled and is_quiet then
+            local is_finished = false
+            if ui and ui.document then
+                local current_page = ui.view and ui.view.state and ui.view.state.page or 1
+                local total_pages = ui.view and ui.view.state and ui.view.state.page_count
+                    or (ui.document and ui.document.getPageCount and ui.document:getPageCount())
+                    or 0
+                if total_pages > 0 and current_page >= total_pages then
+                    is_finished = true
+                end
+                if ui.doc_settings then
+                    local summary = ui.doc_settings:readSetting("summary")
+                    if type(summary) == "table" and summary.status == "complete" then
+                        is_finished = true
+                    end
+                    local lpct = tonumber(ui.doc_settings:readSetting("percent_finished"))
+                    if lpct and lpct >= 0.99 then
+                        is_finished = true
+                    end
+                end
+            end
+
+            -- When reading normally (is_quiet == true), debounce progress push to avoid page turn latency.
+            -- Completion events (is_finished == true) must NEVER be debounced.
+            if not is_finished and defer_enabled and is_quiet then
                 unscheduleDebounce(self_s)
 
                 self_s._pending_push_ui = ui
