@@ -100,12 +100,15 @@ function M.collectKomgaBooks()
         end
     end
 
-    -- 2. Check Bookshelf library filepaths for .sdr metadata
+    -- 2. Check Bookshelf library filepaths for .sdr metadata (scoped to Komga download dir)
     local ok_r, Repo = pcall(require, "lib/bookshelf_book_repository")
     if ok_r and Repo and Repo.getAllFilepaths then
         local filepaths = Repo.getAllFilepaths() or {}
+        local komga_dl = komga and komga.getDownloadDir and komga:getDownloadDir()
+        local dl_prefix = type(komga_dl) == "string" and (komga_dl:gsub("/+$", "") .. "/") or nil
+
         for _, fp in ipairs(filepaths) do
-            if not books[fp] and isFile(fp) then
+            if not books[fp] and (not dl_prefix or fp:sub(1, #dl_prefix) == dl_prefix) and isFile(fp) then
                 local meta_id = loadDocSettingsMetadata(fp) or loadCustomMetadata(fp)
                 if meta_id and meta_id ~= "" then
                     books[fp] = tostring(meta_id)

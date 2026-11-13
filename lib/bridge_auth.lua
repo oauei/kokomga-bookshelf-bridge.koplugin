@@ -11,17 +11,22 @@ function M.getKomgaPlugin()
     return loaded and loaded["kokomga"] or nil
 end
 
-function M.isKomgaUrl(url, profiles_mod)
-    if type(url) ~= "string" or url == "" then return false end
+local _komga_origins = nil
+local _komga_origins_time = 0
+local ORIGINS_TTL = 30
+
+local function getKomgaOrigins(profiles_mod)
+    local now = os.time()
+    if _komga_origins and (now - _komga_origins_time < ORIGINS_TTL) then
+        return _komga_origins
+    end
+
+    local origins = {}
     local komga = M.getKomgaPlugin()
     local komga_url = komga and komga.settings and komga.settings.server_url
-    local u_lower = url:lower()
-
     if type(komga_url) == "string" and komga_url ~= "" then
-        local k_origin = komga_url:match("^(https?://[^/]+)")
-        if k_origin and u_lower:find(k_origin:lower(), 1, true) then
-            return true
-        end
+        local origin = komga_url:match("^(https?://[^/]+)")
+        if origin then origins[origin:lower()] = true end
     end
 
     if profiles_mod and profiles_mod.getProfiles then
@@ -30,14 +35,36 @@ function M.isKomgaUrl(url, profiles_mod)
             for _, p in ipairs(profiles) do
                 if type(p.base_url) == "string" and p.base_url ~= "" then
                     local p_origin = p.base_url:match("^(https?://[^/]+)")
-                    if p_origin and u_lower:find(p_origin:lower(), 1, true) then
-                        return true
-                    end
+                    if p_origin then origins[p_origin:lower()] = true end
                 end
             end
         end
     end
 
+    _komga_origins = origins
+    _komga_origins_time = now
+    return origins
+end
+
+function M.invalidateOrigins()
+    _komga_origins = nil
+    _komga_origins_time = 0
+end
+
+function M.isKomgaUrl(url, profiles_mod)
+    if type(url) ~= "string" or url == "" then return false end
+
+    -- 1. Fast O(1) origin lookup
+    local origin = url:match("^(https?://[^/]+)")
+    if origin then
+        local origins = getKomgaOrigins(profiles_mod)
+        if origins[origin:lower()] then
+            return true
+        end
+    end
+
+    -- 2. Fallback check for relative or standard Komga path segments
+    local u_lower = url:lower()
     if u_lower:find("/opds/v1.2/", 1, true) or u_lower:find("/api/v1/", 1, true) or u_lower:find("/api/v2/", 1, true) then
         return true
     end

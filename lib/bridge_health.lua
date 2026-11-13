@@ -15,7 +15,8 @@ local M = {
     _in_subprocess = false,
     COOLDOWN_SECONDS = 60,
     CACHE_VALID_SECONDS = 15,
-    MAIN_THREAD_MAX_TIMEOUT = 1.5,
+    MAIN_THREAD_MAX_TIMEOUT = 0.5,
+    PROBE_TIMEOUT = 0.25, -- 250ms fast probe for local LAN
 }
 
 local function parseUrl(url)
@@ -148,7 +149,7 @@ function M.isServerReachable(url, force_probe)
     if ok_sock and socket and socket.tcp then
         local ok_call, s = pcall(socket.tcp)
         if ok_call and s then
-            pcall(s.settimeout, s, 1.0)
+            pcall(s.settimeout, s, M.PROBE_TIMEOUT or 0.25)
             local res, err = s:connect(host, port)
             pcall(s.close, s)
             if res then
