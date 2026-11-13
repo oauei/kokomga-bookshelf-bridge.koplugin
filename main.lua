@@ -18,6 +18,11 @@ local BridgePlugin = WidgetContainer:extend{
 
 function BridgePlugin:init()
     BridgePlugin.instance = self
+
+    if self.ui and self.ui.menu then
+        self.ui.menu:registerToMainMenu(self)
+    end
+
     logger.info("[Bridge] Initializing Kokomga-Bookshelf Bridge...")
 
     -- 1. Install HTTP/HTTPS auth interceptor
