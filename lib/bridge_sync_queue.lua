@@ -8,6 +8,7 @@ local os = require("os")
 
 local M = {
     _flushing = false,
+    _flushing_started_at = nil,
     _settings_file = "kokomga_sync_queue.lua",
 }
 
@@ -160,7 +161,8 @@ function M.isServerFurther(server_book, queued_item)
         return false, "missing data"
     end
 
-    local s_prog = server_book.readProgress
+    local raw_prog = server_book.readProgress
+    local s_prog = (type(raw_prog) == "table") and raw_prog or nil
     local s_completed = (s_prog and s_prog.completed == true)
     local s_page = s_prog and tonumber(s_prog.page) or 0
     local q_completed = (queued_item.completed == true)
@@ -193,7 +195,8 @@ function M.isServerFurther(server_book, queued_item)
     end
 
     -- 4. Series frontier comparison (if book belongs to a series)
-    local series_id = server_book.seriesId
+    local raw_series_id = server_book.seriesId
+    local series_id = (type(raw_series_id) == "string" or type(raw_series_id) == "number") and raw_series_id or nil
     if series_id then
         local ok_ds, DataStorage = pcall(require, "datastorage")
         local ok_ls, LuaSettings = pcall(require, "luasettings")
@@ -203,13 +206,17 @@ function M.isServerFurther(server_book, queued_item)
                 local lists = s:readSetting("lists") or {}
                 local aq = lists["active_queue"]
                 local frontier_dto = aq and aq.items and aq.items.by_series and aq.items.by_series[tostring(series_id)]
-                if frontier_dto then
+                if type(frontier_dto) == "table" then
                     local ok_d, Dedup = pcall(require, "lib/hybrid_dedup")
                     if ok_d and Dedup and Dedup.extractChapterNumber then
-                        local frontier_num = Dedup.extractChapterNumber(frontier_dto)
-                        local book_num = Dedup.extractChapterNumber(server_book)
-                            or (queued_item.filepath and Dedup.extractChapterNumber({ filepath = queued_item.filepath }))
-                        if frontier_num and book_num and book_num < frontier_num and not q_completed then
+                        local ok_fn, frontier_num = pcall(Dedup.extractChapterNumber, frontier_dto)
+                        local ok_bn, book_num = pcall(Dedup.extractChapterNumber, server_book)
+                        if not ok_bn or not book_num then
+                            if queued_item.filepath then
+                                ok_bn, book_num = pcall(Dedup.extractChapterNumber, { filepath = queued_item.filepath })
+                            end
+                        end
+                        if ok_fn and ok_bn and frontier_num and book_num and book_num < frontier_num and not q_completed then
                             return true, string.format("server series frontier chapter %s > queued chapter %s", tostring(frontier_num), tostring(book_num))
                         end
                     end
@@ -240,9 +247,16 @@ end
 
 function M.flush(api, on_complete)
     if M._flushing then
-        logger.info("[Bridge SyncQueue] Flush already in progress, skipping")
-        if on_complete then on_complete(false, "In progress") end
-        return false
+        local elapsed = M._flushing_started_at and (os.time() - M._flushing_started_at) or 0
+        if elapsed > 60 then
+            logger.warn(string.format("[Bridge SyncQueue] Stale flush lock detected (%ds elapsed); resetting lock", elapsed))
+            M._flushing = false
+            M._flushing_started_at = nil
+        else
+            logger.info("[Bridge SyncQueue] Flush already in progress, skipping")
+            if on_complete then on_complete(false, "In progress") end
+            return false
+        end
     end
 
     local q = M.getQueue()
@@ -273,6 +287,7 @@ function M.flush(api, on_complete)
     end
 
     M._flushing = true
+    M._flushing_started_at = os.time()
     logger.info(string.format("[Bridge SyncQueue] Starting cooperative flush for %d pending items", count))
 
     local actions_list = {}
@@ -290,6 +305,7 @@ function M.flush(api, on_complete)
 
     local function finish_flush()
         M._flushing = false
+        M._flushing_started_at = nil
         local stats = {
             pushed = pushed_cnt,
             pruned = pruned_cnt,
@@ -315,65 +331,81 @@ function M.flush(api, on_complete)
             return
         end
 
-        local item = actions_list[idx]
-        local book_id = item.book_id
-
-        local server_book, s_err, s_unreachable = fetchServerBook(api, book_id)
-        if s_unreachable then
-            logger.warn("[Bridge SyncQueue] Flush interrupted by unreachable server during book check:", tostring(s_err))
-            if ok_h and Health and Health.tripCircuitBreaker then
-                Health.tripCircuitBreaker(s_err)
-            end
-            unreachable_encountered = true
-            failure_reason = tostring(s_err)
-            finish_flush()
-            return
-        end
-
-        local server_further, reason = false, nil
-        if server_book and type(server_book) == "table" then
-            server_further, reason = M.isServerFurther(server_book, item)
-        end
-
-        if server_further then
-            logger.info(string.format("[Bridge SyncQueue] Server progress is further for book %s (%s). Dropping stale queued update.",
-                tostring(book_id), tostring(reason)))
-            M.remove(book_id)
-            pruned_cnt = pruned_cnt + 1
-        else
-            local success, err, is_unreachable
-            if item.action == "delete" then
-                success, err, is_unreachable = api:request("/api/v1/books/" .. tostring(book_id) .. "/read-progress", "DELETE", nil, { timeout = 3, total_timeout = 5 })
-            else
-                success, err, is_unreachable = api:patch_read_progress(book_id, item.page, item.completed, { timeout = 3, total_timeout = 5 })
+        local aborted = false
+        local ok_step, step_err = pcall(function()
+            local item = actions_list[idx]
+            local book_id = item and item.book_id
+            if not book_id then
+                return
             end
 
-            if success then
+            local server_book, s_err, s_unreachable = fetchServerBook(api, book_id)
+            if s_unreachable then
+                logger.warn("[Bridge SyncQueue] Flush interrupted by unreachable server during book check:", tostring(s_err))
+                if ok_h and Health and Health.tripCircuitBreaker then
+                    Health.tripCircuitBreaker(s_err)
+                end
+                unreachable_encountered = true
+                failure_reason = tostring(s_err)
+                finish_flush()
+                aborted = true
+                return
+            end
+
+            local server_further, reason = false, nil
+            if server_book and type(server_book) == "table" then
+                server_further, reason = M.isServerFurther(server_book, item)
+            end
+
+            if server_further then
+                logger.info(string.format("[Bridge SyncQueue] Server progress is further for book %s (%s). Dropping stale queued update.",
+                    tostring(book_id), tostring(reason)))
                 M.remove(book_id)
-                pushed_cnt = pushed_cnt + 1
-                logger.info(string.format("[Bridge SyncQueue] Flushed book %s (page=%s, completed=%s)",
-                    tostring(book_id),
-                    tostring(item.page),
-                    tostring(item.completed)
-                ))
+                pruned_cnt = pruned_cnt + 1
             else
-                local err_str = tostring(err):lower()
-                if is_unreachable or err_str:find("timeout") or err_str:find("unreachable") or err_str:find("refused") then
-                    logger.warn("[Bridge SyncQueue] Flush interrupted by unreachable server:", tostring(err))
-                    if ok_h and Health and Health.tripCircuitBreaker then
-                        Health.tripCircuitBreaker(err)
-                    end
-                    unreachable_encountered = true
-                    failure_reason = tostring(err)
-                    finish_flush()
-                    return
+                local success, err, is_unreachable
+                if item.action == "delete" then
+                    success, err, is_unreachable = api:request("/api/v1/books/" .. tostring(book_id) .. "/read-progress", "DELETE", nil, { timeout = 3, total_timeout = 5 })
                 else
-                    -- Client error (e.g. 404 book deleted), consider handled to avoid infinite queue loop
-                    logger.warn(string.format("[Bridge SyncQueue] Dropping book %s from queue after client error: %s", tostring(book_id), tostring(err)))
+                    success, err, is_unreachable = api:patch_read_progress(book_id, item.page, item.completed, { timeout = 3, total_timeout = 5 })
+                end
+
+                if success then
                     M.remove(book_id)
-                    pruned_cnt = pruned_cnt + 1
+                    pushed_cnt = pushed_cnt + 1
+                    logger.info(string.format("[Bridge SyncQueue] Flushed book %s (page=%s, completed=%s)",
+                        tostring(book_id),
+                        tostring(item.page),
+                        tostring(item.completed)
+                    ))
+                else
+                    local err_str = tostring(err):lower()
+                    if is_unreachable or err_str:find("timeout") or err_str:find("unreachable") or err_str:find("refused") then
+                        logger.warn("[Bridge SyncQueue] Flush interrupted by unreachable server:", tostring(err))
+                        if ok_h and Health and Health.tripCircuitBreaker then
+                            Health.tripCircuitBreaker(err)
+                        end
+                        unreachable_encountered = true
+                        failure_reason = tostring(err)
+                        finish_flush()
+                        aborted = true
+                        return
+                    else
+                        -- Client error (e.g. 404 book deleted), consider handled to avoid infinite queue loop
+                        logger.warn(string.format("[Bridge SyncQueue] Dropping book %s from queue after client error: %s", tostring(book_id), tostring(err)))
+                        M.remove(book_id)
+                        pruned_cnt = pruned_cnt + 1
+                    end
                 end
             end
+        end)
+
+        if not ok_step then
+            logger.warn("[Bridge SyncQueue] Unexpected error flushing item " .. tostring(idx) .. ": " .. tostring(step_err))
+        end
+
+        if aborted then
+            return
         end
 
         if has_ui then
