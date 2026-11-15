@@ -12,12 +12,38 @@ local M = {
     _last_checked_at = 0,
     _is_reachable = true,
     _failure_count = 0,
+    _timeout_failures = 0,
     _in_subprocess = false,
-    COOLDOWN_SECONDS = 60,
+    _dns_cache = {},
+    _async_probe_in_flight = false,
+    COOLDOWN_SECONDS = 20,
     CACHE_VALID_SECONDS = 15,
-    MAIN_THREAD_MAX_TIMEOUT = 0.5,
+    DNS_CACHE_TTL = 300,
+    TIMEOUT_FAILURE_THRESHOLD = 3,
+    MAIN_THREAD_MAX_TIMEOUT = 1.5,
     PROBE_TIMEOUT = 0.25, -- 250ms fast probe for local LAN
 }
+
+local function isIpLiteral(host)
+    if type(host) ~= "string" then return false end
+    return host:match("^%d+%.%d+%.%d+%.%d+$") ~= nil or host:find(":", 1, true) ~= nil
+end
+
+function M.getCachedIp(host)
+    if not host then return nil end
+    if isIpLiteral(host) then return host end
+    local entry = M._dns_cache[host]
+    if entry and (os.time() - entry.ts) < M.DNS_CACHE_TTL then
+        return entry.ip
+    end
+    return nil
+end
+
+function M.setCachedIp(host, ip)
+    if host and ip and ip ~= "" then
+        M._dns_cache[host] = { ip = ip, ts = os.time() }
+    end
+end
 
 local function parseUrl(url)
     if type(url) ~= "string" or url == "" then return nil, nil, nil end
@@ -63,11 +89,13 @@ function M.resetCircuitBreaker()
     M._last_checked_at = 0
     M._is_reachable = true
     M._failure_count = 0
+    M._timeout_failures = 0
     logger.info("[Bridge Health] Circuit breaker reset.")
 end
 
 function M.reportSuccess()
     M._failure_count = 0
+    M._timeout_failures = 0
     M._is_reachable = true
     M._last_checked_at = os.time()
     if M._breaker_until > 0 then
@@ -75,18 +103,30 @@ function M.reportSuccess()
     end
 end
 
-function M.reportFailure(err)
+function M.reportFailure(err, opts)
     local err_str = tostring(err):lower()
-    local is_unreachable = err_str:find("timeout") ~= nil
-        or err_str:find("refused") ~= nil
+    local is_timeout = err_str:find("timeout") ~= nil
+    local is_hard_unreachable = err_str:find("refused") ~= nil
         or err_str:find("host not found") ~= nil
         or err_str:find("unreachable") ~= nil
         or err_str:find("no route") ~= nil
         or err_str:find("closed") ~= nil
         or err_str:find("network is down") ~= nil
         or err_str:find("network unreachable") ~= nil
-    if is_unreachable then
+
+    if is_hard_unreachable then
         M.tripCircuitBreaker(err)
+        return
+    end
+
+    if is_timeout then
+        if type(opts) == "table" and opts.is_thumbnail then
+            return
+        end
+        M._timeout_failures = (M._timeout_failures or 0) + 1
+        if M._timeout_failures >= (M.TIMEOUT_FAILURE_THRESHOLD or 3) then
+            M.tripCircuitBreaker(err)
+        end
     end
 end
 
@@ -113,10 +153,25 @@ function M.getActiveServerUrl(profiles_mod)
     return nil
 end
 
-function M.isServerReachable(url, force_probe)
-    -- 1. Check if device has any network connection
+function M.patchNetworkMgrOnline()
     local ok_net, NetworkMgr = pcall(require, "ui/network/manager")
-    if ok_net and NetworkMgr and NetworkMgr.isOnline and not NetworkMgr:isOnline() then
+    if not (ok_net and NetworkMgr) or NetworkMgr._bridge_is_online_patched then
+        return
+    end
+    NetworkMgr._bridge_is_online_patched = true
+    NetworkMgr.isOnline = function(self_nm)
+        if self_nm and self_nm.isConnected then
+            return self_nm:isConnected()
+        end
+        return true
+    end
+    logger.info("[Bridge Health] Patched NetworkMgr:isOnline() to use fast local isConnected()")
+end
+
+function M.isServerReachable(url, force_probe)
+    -- 1. Check if device has any network connection (avoid blocking DNS in NetworkMgr:isOnline)
+    local ok_net, NetworkMgr = pcall(require, "ui/network/manager")
+    if ok_net and NetworkMgr and NetworkMgr.isConnected and not NetworkMgr:isConnected() then
         return false, "Network offline"
     end
 
@@ -142,6 +197,39 @@ function M.isServerReachable(url, force_probe)
     local host, port = parseUrl(url)
     if not host then return true end
 
+    local target_ip = M.getCachedIp(host)
+    if not target_ip and not M.isInSubprocess() then
+        -- Avoid synchronous gethostbyname on the main LuaJIT thread.
+        -- Trigger an asynchronous curl probe in the background and return cached reachability.
+        local ok_ah, AsyncHttp = pcall(require, "lib/bridge_async_http")
+        if ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable() then
+            if not M._async_probe_in_flight then
+                M._async_probe_in_flight = true
+                local probe_url = url:gsub("/+$", "") .. "/api/v1/books?size=1"
+                AsyncHttp.requestAsync({
+                    url = probe_url,
+                    method = "HEAD",
+                    connect_timeout = 1,
+                    max_time = 2,
+                    skip_health = true,
+                }, function(ok, code, _, err_msg)
+                    M._async_probe_in_flight = false
+                    M._last_checked_at = os.time()
+                    local num_code = tonumber(code) or 0
+                    if ok or (num_code >= 200 and num_code < 500) then
+                        M.reportSuccess()
+                    else
+                        M.tripCircuitBreaker(err_msg or "Async probe failed")
+                    end
+                end)
+            end
+            return M._is_reachable, M._is_reachable and nil or "Server unreachable (cached)"
+        end
+        -- If curl is unavailable, avoid blocking main thread with raw hostname connect
+        M._last_checked_at = now
+        return M._is_reachable
+    end
+
     local probe_ok = false
     local probe_err = nil
 
@@ -150,7 +238,7 @@ function M.isServerReachable(url, force_probe)
         local ok_call, s = pcall(socket.tcp)
         if ok_call and s then
             pcall(s.settimeout, s, M.PROBE_TIMEOUT or 0.25)
-            local res, err = s:connect(host, port)
+            local res, err = s:connect(target_ip or host, port)
             pcall(s.close, s)
             if res then
                 probe_ok = true

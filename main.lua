@@ -55,6 +55,14 @@ function BridgePlugin:onReaderReady()
     MenuPatch.patchKokomgaAutoRtl()
 end
 
+function BridgePlugin:onSuspend()
+    if MenuPatch.onSuspend then MenuPatch.onSuspend() end
+end
+
+function BridgePlugin:onResume()
+    if MenuPatch.onResume then MenuPatch.onResume() end
+end
+
 function BridgePlugin:addToMainMenu(menu_items)
     menu_items.kokomga_bookshelf_bridge = {
         text = _("Komga Bridge"),

@@ -5,9 +5,133 @@ local logger = require("logger")
 
 local M = {}
 
+local function patchPrefetchTarget(cache_tbl)
+    if not (cache_tbl and type(cache_tbl) == "table" and type(cache_tbl.prefetchCovers) == "function") then
+        return
+    end
+    if cache_tbl._bridge_prefetch_patched then return end
+    cache_tbl._bridge_prefetch_patched = true
+
+    local orig_prefetch = cache_tbl.prefetchCovers
+    cache_tbl.prefetchCovers = function(self_c, item_list, type_label)
+        if not item_list or #item_list == 0 then return end
+
+        local ok_ah, AsyncHttp = pcall(require, "lib/bridge_async_http")
+        local ok_ui, UIManager = pcall(require, "ui/uimanager")
+        if not (ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable()
+                and ok_ui and UIManager and UIManager.scheduleIn) then
+            return orig_prefetch(self_c, item_list, type_label)
+        end
+
+        pcall(self_c.ensureStructure, self_c)
+        local ok_ds, DataStorage = pcall(require, "datastorage")
+        if not (ok_ds and DataStorage) then
+            return orig_prefetch(self_c, item_list, type_label)
+        end
+
+        local covers_dir = DataStorage:getDataDir() .. "/komga_covers"
+        local meta_cache = self_c.plugin and self_c.plugin.settings and self_c.plugin.settings.library_metadata_cache
+        local covers_map = meta_cache and meta_cache.covers or {}
+        local never_update = self_c.plugin and self_c.plugin.settings and self_c.plugin.settings.never_update_covers
+
+        local to_download = {}
+        for _, item in ipairs(item_list) do
+            if item and item.id then
+                local cache_key = tostring(type_label) .. "_" .. tostring(item.id)
+                local local_path = covers_dir .. "/" .. cache_key .. ".jpg"
+                local f = io.open(local_path, "rb")
+                local exists = (f ~= nil)
+                if f then f:close() end
+                local needs_dl = not exists or (not never_update and covers_map[cache_key] ~= item.lastModified)
+                if needs_dl then
+                    to_download[#to_download + 1] = {
+                        id = item.id,
+                        lastModified = item.lastModified,
+                        cache_key = cache_key,
+                        dest_path = local_path,
+                    }
+                end
+            end
+        end
+
+        if #to_download == 0 then return end
+
+        local api = self_c.plugin and self_c.plugin.api
+        local base_url = api and api.base_url
+        if not base_url or base_url == "" then
+            return orig_prefetch(self_c, item_list, type_label)
+        end
+
+        local endpoint_type = (type_label == "series") and "series" or "books"
+        local headers = {}
+        if api.get_headers then
+            local ok_h, h = pcall(api.get_headers, api)
+            if ok_h and type(h) == "table" then
+                for k, v in pairs(h) do headers[k] = v end
+            end
+        end
+
+        logger.info(string.format("[Bridge Cache] Async pre-fetching %d covers for %s", #to_download, tostring(type_label)))
+
+        local idx = 1
+        local function stepNext()
+            if idx > #to_download then return end
+            local ok_net, NetworkMgr = pcall(require, "ui/network/manager")
+            if ok_net and NetworkMgr and NetworkMgr.isConnected and not NetworkMgr:isConnected() then
+                return
+            end
+            local entry = to_download[idx]
+            idx = idx + 1
+            local url = tostring(base_url):gsub("/+$", "") .. "/api/v1/" .. endpoint_type .. "/" .. tostring(entry.id) .. "/thumbnail"
+            AsyncHttp.downloadAsync({
+                url = url,
+                headers = headers,
+                tmp_path = entry.dest_path .. ".tmp",
+                dest_path = entry.dest_path,
+                connect_timeout = 2,
+                max_time = 8,
+            }, function(ok)
+                if ok and meta_cache and meta_cache.covers then
+                    meta_cache.covers[entry.cache_key] = entry.lastModified
+                    if self_c.plugin and self_c.plugin.saveSettings then
+                        pcall(self_c.plugin.saveSettings, self_c.plugin)
+                    end
+                end
+                if idx <= #to_download then
+                    UIManager:scheduleIn(0.15, stepNext)
+                end
+            end)
+        end
+
+        UIManager:scheduleIn(0.1, stepNext)
+    end
+
+    logger.info("[Bridge Cache] Patched KomgaCache.prefetchCovers to run asynchronously")
+end
+
+local function installPrefetchHook()
+    pcall(require, "plugins/kokomga.koplugin/core/cache")
+    pcall(require, "core/cache")
+    for k, v in pairs(package.loaded) do
+        if type(k) == "string" and k:find("core/cache") and type(v) == "table" then
+            patchPrefetchTarget(v)
+            patchPrefetchTarget(getmetatable(v))
+        end
+    end
+    local ok_p, PluginLoader = pcall(require, "pluginloader")
+    local loaded = ok_p and PluginLoader and PluginLoader.loaded_plugins or nil
+    local komga = loaded and loaded["kokomga"]
+    if komga and komga.cache then
+        patchPrefetchTarget(komga.cache)
+        patchPrefetchTarget(getmetatable(komga.cache))
+    end
+end
+
 function M.installCacheHook(profiles_mod)
     if M._installed then return end
     M._installed = true
+
+    installPrefetchHook()
 
     local ok_c, OpdsCovers = pcall(require, "lib/bookshelf_opds_covers")
     if not (ok_c and OpdsCovers and OpdsCovers.cachedPath) then

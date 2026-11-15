@@ -6,6 +6,7 @@ local UIManager = require("ui/uimanager")
 local ButtonDialog = require("ui/widget/buttondialog")
 local Notification = require("ui/widget/notification")
 local _ = require("gettext")
+local Health = require("lib/bridge_health")
 
 local M = {}
 
@@ -337,11 +338,39 @@ function M.patchKokomgaMenu(profiles_mod)
                             end,
                         }
 
+                        local long_strip_item = {
+                            text = _("Auto Long-Strip Scroll Mode"),
+                            help_text = _("Automatically enables continuous vertical scrolling, fit-to-content-width zoom, and LTR order for long-strip/webtoon comics without affecting normal manga."),
+                            checked_func = function()
+                                if G_reader_settings and G_reader_settings.readSetting then
+                                    return G_reader_settings:readSetting("bridge_auto_long_strip") ~= false
+                                end
+                                return true
+                            end,
+                            keep_menu_open = true,
+                            callback = function(touchmenu_instance)
+                                local curr = true
+                                if G_reader_settings and G_reader_settings.readSetting then
+                                    curr = G_reader_settings:readSetting("bridge_auto_long_strip") ~= false
+                                end
+                                local new_val = not curr
+                                if G_reader_settings then
+                                    G_reader_settings:saveSetting("bridge_auto_long_strip", new_val)
+                                    pcall(function() G_reader_settings:flush() end)
+                                end
+                                if touchmenu_instance and touchmenu_instance.updateItems then
+                                    touchmenu_instance:updateItems()
+                                end
+                            end,
+                        }
+
                         if rtl_idx then
                             table.insert(sub_items, rtl_idx + 1, adv_item)
-                            table.insert(sub_items, rtl_idx + 2, defer_item)
+                            table.insert(sub_items, rtl_idx + 2, long_strip_item)
+                            table.insert(sub_items, rtl_idx + 3, defer_item)
                         else
                             table.insert(sub_items, adv_item)
+                            table.insert(sub_items, long_strip_item)
                             table.insert(sub_items, defer_item)
                         end
                         return sub_items
@@ -890,12 +919,20 @@ function M.patchKokomgaAutoRtl()
         ReaderPaging.onReaderReady = function(self_rp, ...)
             if orig_rp_ready then orig_rp_ready(self_rp, ...) end
             M.handleAutoRtlAdvanced(self_rp.ui)
+            local ok_ls, LongStrip = pcall(require, "lib/bridge_long_strip")
+            if ok_ls and LongStrip and LongStrip.applyIfNeeded then
+                LongStrip.applyIfNeeded(self_rp.ui)
+            end
         end
     end
 
     local ok_r, ReaderUI = pcall(require, "apps/reader/readerui")
     if ok_r and ReaderUI and ReaderUI.instance then
         M.handleAutoRtlAdvanced(ReaderUI.instance)
+        local ok_ls, LongStrip = pcall(require, "lib/bridge_long_strip")
+        if ok_ls and LongStrip and LongStrip.applyIfNeeded then
+            LongStrip.applyIfNeeded(ReaderUI.instance)
+        end
     end
 
     -- 2. Scan loaded plugins for kokomga prototype
@@ -1090,6 +1127,90 @@ local function patchSyncTarget(sync_target)
         end
     end
 
+local _suspend_in_progress = false
+local _resume_cooldown_until = 0
+
+local function isLifecycleCooldown()
+    return _suspend_in_progress or os.time() < _resume_cooldown_until
+end
+
+local function isNetworkOffline()
+    local ok_nm, NetworkMgr = pcall(require, "ui/network/manager")
+    if ok_nm and NetworkMgr and NetworkMgr.isConnected then
+        return not NetworkMgr:isConnected()
+    end
+    return false
+end
+
+local function enqueueDocumentProgress(self_s, ui, SyncQueue, reason_label)
+    if not (ui and ui.document) then return false end
+    local filepath = ui.document.file
+    local book_id = filepath and self_s.getOrMatchBook and self_s:getOrMatchBook(filepath)
+    if not book_id then return false end
+
+    local current_page = ui.view and ui.view.state and ui.view.state.page or 1
+    local total_pages = ui.view and ui.view.state and ui.view.state.page_count
+        or (ui.document and ui.document.getPageCount and ui.document:getPageCount())
+        or current_page
+    local is_completed = (total_pages and total_pages > 0 and current_page >= total_pages)
+    if ui.doc_settings then
+        local summary = ui.doc_settings:readSetting("summary")
+        if summary and type(summary) == "table" and summary.status == "complete" then
+            is_completed = true
+        end
+        local lpct = tonumber(ui.doc_settings:readSetting("percent_finished"))
+        if lpct and lpct >= 0.99 then
+            is_completed = true
+        end
+    end
+    SyncQueue.enqueue("progress", book_id, {
+        page = current_page,
+        total_pages = total_pages,
+        completed = is_completed,
+        filepath = filepath,
+    })
+    logger.info(string.format("[Bridge] %s: buffered pushProgressForDocument for book %s (page %d/%d, completed=%s)",
+        tostring(reason_label or "Deferred"), tostring(book_id), current_page, total_pages, tostring(is_completed)))
+    return true
+end
+
+local function dispatchAsyncProgressPush(self_s, book_id, current_page, total_pages, SyncQueue, orig_push, is_quiet)
+    local completed = (total_pages and total_pages > 0 and current_page >= total_pages) or false
+    local ok_ah, AsyncHttp = pcall(require, "lib/bridge_async_http")
+    local api = self_s and self_s.plugin and self_s.plugin.api
+    if ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable()
+            and SyncQueue.buildApiRequestOpts and api then
+        local req_opts = SyncQueue.buildApiRequestOpts(
+            api,
+            "/api/v1/books/" .. tostring(book_id) .. "/read-progress",
+            "PATCH",
+            { page = current_page, completed = completed }
+        )
+        if req_opts then
+            local launched = AsyncHttp.requestAsync(req_opts, function(ok, code, _, err_msg)
+                if ok then
+                    Health.reportSuccess()
+                    if SyncQueue.hasPending() then
+                        SyncQueue.flush(api)
+                    end
+                else
+                    SyncQueue.enqueue("progress", book_id, {
+                        page = current_page,
+                        total_pages = total_pages,
+                        completed = completed,
+                    })
+                    logger.warn(string.format("[Bridge] Async pushProgress failed for %s (code=%s, err=%s); queued for retry",
+                        tostring(book_id), tostring(code), tostring(err_msg)))
+                end
+            end)
+            if launched then
+                return true
+            end
+        end
+    end
+    return orig_push(self_s, book_id, current_page, total_pages, is_quiet)
+end
+
     -- 6. pushProgressForDocument
     if sync_target.pushProgressForDocument then
         local orig_push_doc = sync_target.pushProgressForDocument
@@ -1175,47 +1296,31 @@ local function patchSyncTarget(sync_target)
             self_s._pending_ensure_networking = nil
 
             local SyncQueue = require("lib/bridge_sync_queue")
-            local ok_nm, NetworkMgr = pcall(require, "ui/network/manager")
-            local is_offline = ok_nm and NetworkMgr and (not NetworkMgr:isOnline())
+            local is_offline = isNetworkOffline()
+            local lifecycle_busy = isLifecycleCooldown()
             local reachable, reason = Health.isServerReachable()
             local cb_active = (self_s.isCircuitBreakerActive and self_s:isCircuitBreakerActive())
 
-            if is_offline or not reachable or cb_active then
-                if ui and ui.document then
-                    local filepath = ui.document.file
-                    local book_id = filepath and self_s.getOrMatchBook and self_s:getOrMatchBook(filepath)
-                    if book_id then
-                        local current_page = ui.view and ui.view.state and ui.view.state.page or 1
-                        local total_pages = ui.view and ui.view.state and ui.view.state.page_count
-                            or (ui.document and ui.document.getPageCount and ui.document:getPageCount())
-                            or current_page
-                        local is_completed = (total_pages and total_pages > 0 and current_page >= total_pages)
-                        if ui.doc_settings then
-                            local summary = ui.doc_settings:readSetting("summary")
-                            if summary and type(summary) == "table" and summary.status == "complete" then
-                                is_completed = true
-                            end
-                            local lpct = tonumber(ui.doc_settings:readSetting("percent_finished"))
-                            if lpct and lpct >= 0.99 then
-                                is_completed = true
-                            end
-                        end
-                        SyncQueue.enqueue("progress", book_id, {
-                            page = current_page,
-                            total_pages = total_pages,
-                            completed = is_completed,
-                            filepath = filepath,
-                        })
-                        logger.info(string.format("[Bridge] Offline/unreachable: buffered pushProgressForDocument for book %s (page %d/%d, completed=%s)",
-                            tostring(book_id), current_page, total_pages, tostring(is_completed)))
-                    end
-                end
+            if lifecycle_busy or is_offline or not reachable or cb_active then
+                local why = lifecycle_busy and "Lifecycle cooldown" or "Offline/unreachable"
+                enqueueDocumentProgress(self_s, ui, SyncQueue, why)
                 return
             end
 
             -- Server is reachable: flush any pending offline queue items in background
             if SyncQueue.hasPending() and self_s.plugin and self_s.plugin.api then
                 SyncQueue.flush(self_s.plugin.api)
+            end
+
+            local filepath = ui and ui.document and ui.document.file
+            local book_id = filepath and self_s.getOrMatchBook and self_s:getOrMatchBook(filepath)
+            if book_id then
+                local current_page = ui.view and ui.view.state and ui.view.state.page or 1
+                local total_pages = ui.view and ui.view.state and ui.view.state.page_count
+                    or (ui.document and ui.document.getPageCount and ui.document:getPageCount())
+                    or current_page
+                return dispatchAsyncProgressPush(self_s, book_id, current_page, total_pages, SyncQueue,
+                    function() return orig_push_doc(self_s, ui, is_quiet, ensure_networking) end, is_quiet)
             end
 
             return orig_push_doc(self_s, ui, is_quiet, ensure_networking)
@@ -1227,24 +1332,25 @@ local function patchSyncTarget(sync_target)
         local orig_push = sync_target.pushProgress
         sync_target.pushProgress = function(self_s, book_id, current_page, total_pages, is_quiet)
             local SyncQueue = require("lib/bridge_sync_queue")
-            local ok_nm, NetworkMgr = pcall(require, "ui/network/manager")
-            local is_offline = ok_nm and NetworkMgr and (not NetworkMgr:isOnline())
+            local is_offline = isNetworkOffline()
+            local lifecycle_busy = isLifecycleCooldown()
             local reachable, reason = Health.isServerReachable()
             local cb_active = (self_s.isCircuitBreakerActive and self_s:isCircuitBreakerActive())
 
-            if is_offline or not reachable or cb_active then
+            if lifecycle_busy or is_offline or not reachable or cb_active then
                 local completed = (total_pages and total_pages > 0 and current_page >= total_pages)
                 SyncQueue.enqueue("progress", book_id, {
                     page = current_page,
                     total_pages = total_pages,
                     completed = completed,
                 })
-                logger.info(string.format("[Bridge] Offline/unreachable: buffered pushProgress for book %s (page %d/%s, completed=%s)",
+                logger.info(string.format("[Bridge] %s: buffered pushProgress for book %s (page %d/%s, completed=%s)",
+                    lifecycle_busy and "Lifecycle cooldown" or "Offline/unreachable",
                     tostring(book_id), current_page, tostring(total_pages), tostring(completed)))
                 return
             end
 
-            return orig_push(self_s, book_id, current_page, total_pages, is_quiet)
+            return dispatchAsyncProgressPush(self_s, book_id, current_page, total_pages, SyncQueue, orig_push, is_quiet)
         end
     end
 
@@ -1295,17 +1401,59 @@ local function hookOnNetworkConnected(target)
     target._bridge_net_hooked = true
     local orig_net = target.onNetworkConnected
     target.onNetworkConnected = function(self_k, ...)
-        local Health = require("lib/bridge_health")
         Health.resetCircuitBreaker()
         local SyncQueue = require("lib/bridge_sync_queue")
         local api = self_k.api or (self_k.getKomgaPlugin and self_k.getKomgaPlugin() and self_k.getKomgaPlugin().api)
-        if api then
-            SyncQueue.flush(api)
+        local function doFlush()
+            if api then
+                SyncQueue.flush(api)
+            else
+                SyncQueue.flush()
+            end
+        end
+        if isLifecycleCooldown() and UIManager and UIManager.scheduleIn then
+            local delay = math.max(0.5, (_resume_cooldown_until - os.time()) + 0.5)
+            UIManager:scheduleIn(delay, doFlush)
         else
-            SyncQueue.flush()
+            doFlush()
         end
         if orig_net then
             return orig_net(self_k, ...)
+        end
+    end
+end
+
+local function hookLifecycleEvents(target)
+    if not (target and type(target) == "table") then return end
+    if target._bridge_lifecycle_hooked then return end
+    target._bridge_lifecycle_hooked = true
+
+    if type(target.onSuspend) == "function" or type(target._onSuspend) == "function" then
+        local fn_name = type(target.onSuspend) == "function" and "onSuspend" or "_onSuspend"
+        local orig_suspend = target[fn_name]
+        target[fn_name] = function(self_t, ...)
+            _suspend_in_progress = true
+            -- Note: KOSync:_onSuspend calls updateProgress(true, false, true);
+            -- setting _suspend_in_progress ensures Komga pushes enqueue to disk instead of blocking ALooper.
+            return orig_suspend(self_t, ...)
+        end
+    end
+
+    if type(target.onResume) == "function" or type(target._onResume) == "function" then
+        local fn_name = type(target.onResume) == "function" and "onResume" or "_onResume"
+        local orig_resume = target[fn_name]
+        target[fn_name] = function(self_t, ...)
+            _suspend_in_progress = false
+            _resume_cooldown_until = os.time() + 3
+            local args = { ... }
+            if UIManager and UIManager.scheduleIn then
+                -- Defer resume network syncs past the 3s cooldown so MainActivity.onResume/surfaceCreated never wait on sockets
+                UIManager:scheduleIn(3.1, function()
+                    pcall(orig_resume, self_t, unpack(args))
+                end)
+                return
+            end
+            return orig_resume(self_t, ...)
         end
     end
 end
@@ -1353,6 +1501,8 @@ function M.patchKokomgaSync()
     if proto then
         hookOnNetworkConnected(proto)
         hookOnNetworkConnected(getmetatable(proto))
+        hookLifecycleEvents(proto)
+        hookLifecycleEvents(getmetatable(proto))
         if proto.sync then
             patchSyncTarget(proto.sync)
             patchSyncTarget(getmetatable(proto.sync))
@@ -1363,6 +1513,7 @@ function M.patchKokomgaSync()
             proto.init = function(self_k, ...)
                 orig_init(self_k, ...)
                 hookOnNetworkConnected(self_k)
+                hookLifecycleEvents(self_k)
                 if self_k.sync then
                     patchSyncTarget(self_k.sync)
                     patchSyncTarget(getmetatable(self_k.sync))
@@ -1370,9 +1521,25 @@ function M.patchKokomgaSync()
             end
         end
     end
+
+    local kosync = loaded and loaded["kosync"]
+    if kosync then
+        hookLifecycleEvents(kosync)
+        hookLifecycleEvents(getmetatable(kosync))
+    end
+end
+
+function M.onSuspend()
+    _suspend_in_progress = true
+end
+
+function M.onResume()
+    _suspend_in_progress = false
+    _resume_cooldown_until = os.time() + 3
 end
 
 function M.installAll(profiles_mod)
+    Health.patchNetworkMgrOnline()
     hookBookshelfRegister()
     hookSourcesChanged()
     M.patchBookshelfSettings(profiles_mod)
@@ -1381,6 +1548,18 @@ function M.installAll(profiles_mod)
     M.patchKomgaApi()
     M.patchKokomgaAutoRtl()
     M.patchKokomgaSync()
+    if UIManager and UIManager.nextTick then
+        -- Re-run once after all plugins finish init so late-loaded plugins (e.g. kosync) are hooked
+        UIManager:nextTick(function()
+            Health.patchNetworkMgrOnline()
+            local ok_p, PluginLoader = pcall(require, "pluginloader")
+            local loaded = ok_p and PluginLoader and PluginLoader.loaded_plugins or nil
+            if loaded and loaded["kosync"] then
+                hookLifecycleEvents(loaded["kosync"])
+                hookLifecycleEvents(getmetatable(loaded["kosync"]))
+            end
+        end)
+    end
 end
 
 return M
