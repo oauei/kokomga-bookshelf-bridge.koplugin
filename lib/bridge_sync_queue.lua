@@ -13,11 +13,19 @@ local M = {
 }
 
 local function getSettings()
+    if M._flushing and M._flush_settings and M._flush_settings_file == M._settings_file then
+        return M._flush_settings
+    end
     local ok_ds, DataStorage = pcall(require, "datastorage")
     local ok_ls, LuaSettings = pcall(require, "luasettings")
     if ok_ds and DataStorage and ok_ls and LuaSettings then
         local dir = DataStorage:getSettingsDir()
-        return LuaSettings:open(dir .. "/" .. M._settings_file)
+        local s = LuaSettings:open(dir .. "/" .. M._settings_file)
+        if M._flushing and s then
+            M._flush_settings = s
+            M._flush_settings_file = M._settings_file
+        end
+        return s
     end
     return nil
 end
@@ -416,6 +424,8 @@ function M.flush(api, on_complete)
                 pcall(function() s:flush() end)
             end
         end
+        M._flush_settings = nil
+        M._flush_settings_file = nil
         M._flushing = false
         M._flushing_started_at = nil
         if pushed_cnt > 0 or pruned_cnt > 0 then
