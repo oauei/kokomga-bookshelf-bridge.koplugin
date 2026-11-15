@@ -20,8 +20,8 @@ local M = {
     CACHE_VALID_SECONDS = 15,
     DNS_CACHE_TTL = 300,
     TIMEOUT_FAILURE_THRESHOLD = 3,
-    MAIN_THREAD_MAX_TIMEOUT = 0.5,
-    PROBE_TIMEOUT = 0.25, -- 250ms fast probe for local LAN
+    MAIN_THREAD_MAX_TIMEOUT = 1.5,
+    PROBE_TIMEOUT = 0.5, -- 500ms fast probe for LAN/Wi-Fi
 }
 
 local function isIpLiteral(host)
