@@ -127,6 +127,12 @@ local function installPrefetchHook()
     end
 end
 
+local _aliased_cover_cache = {}
+
+function M.clearAliasedCoverCache()
+    _aliased_cover_cache = {}
+end
+
 function M.installCacheHook(profiles_mod)
     if M._installed then return end
     M._installed = true
@@ -143,20 +149,32 @@ function M.installCacheHook(profiles_mod)
         local path = orig_cachedPath(rec)
         if path then return path end
 
-        -- If not found under current profile, check candidate hashes from other profiles
-        local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
-        if not (ok_lfs and lfs and profiles_mod and profiles_mod.getAllKomgaServerKeys) then
-            return nil
-        end
-
         local rec_url = rec and rec.opds and (rec.opds.cover_url or rec.opds.thumbnail_url)
         if not rec_url or type(rec_url) ~= "string" then return nil end
 
+        local cached_alias = _aliased_cover_cache[rec_url]
+        if cached_alias ~= nil then
+            return cached_alias or nil
+        end
+
+        -- If not found under current profile, check candidate hashes from other profiles
+        local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+        if not (ok_lfs and lfs and profiles_mod and profiles_mod.getAllKomgaServerKeys) then
+            _aliased_cover_cache[rec_url] = false
+            return nil
+        end
+
         local ok_s, OpdsSource = pcall(require, "lib/bookshelf_opds_source")
-        if not (ok_s and OpdsSource and OpdsSource.serverKey) then return nil end
+        if not (ok_s and OpdsSource and OpdsSource.serverKey) then
+            _aliased_cover_cache[rec_url] = false
+            return nil
+        end
 
         local base_dir = OpdsCovers.cacheDir and OpdsCovers.cacheDir()
-        if not base_dir then return nil end
+        if not base_dir then
+            _aliased_cover_cache[rec_url] = false
+            return nil
+        end
 
         local all_keys = profiles_mod.getAllKomgaServerKeys()
         local url_hash = OpdsSource.serverKey(rec_url)
@@ -166,6 +184,7 @@ function M.installCacheHook(profiles_mod)
             local candidate = base_dir .. "/" .. sk .. "/" .. url_hash .. ".img"
             local ok_a, a = pcall(lfs.attributes, candidate)
             if ok_a and a and a.mode == "file" then
+                _aliased_cover_cache[rec_url] = candidate
                 return candidate
             end
         end
@@ -184,6 +203,7 @@ function M.installCacheHook(profiles_mod)
                             local candidate = base_dir .. "/" .. sk .. "/" .. alt_hash .. ".img"
                             local ok_a, a = pcall(lfs.attributes, candidate)
                             if ok_a and a and a.mode == "file" then
+                                _aliased_cover_cache[rec_url] = candidate
                                 return candidate
                             end
                         end
@@ -192,6 +212,7 @@ function M.installCacheHook(profiles_mod)
             end
         end
 
+        _aliased_cover_cache[rec_url] = false
         return nil
     end
 

@@ -249,4 +249,5 @@ function M.downloadAsync(opts, callback)
     end)
 end
 
+M.escapeCfgValue = escapeCfgValue
 return M

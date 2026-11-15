@@ -13,6 +13,8 @@ end
 
 local _komga_origins = nil
 local _komga_origins_time = 0
+local _cached_auth_headers = nil
+local _cached_auth_key = nil
 local ORIGINS_TTL = 30
 
 local function getKomgaOrigins(profiles_mod)
@@ -49,6 +51,8 @@ end
 function M.invalidateOrigins()
     _komga_origins = nil
     _komga_origins_time = 0
+    _cached_auth_headers = nil
+    _cached_auth_key = nil
 end
 
 function M.isKomgaUrl(url, profiles_mod)
@@ -58,14 +62,12 @@ function M.isKomgaUrl(url, profiles_mod)
     local origin = url:match("^(https?://[^/]+)")
     if origin then
         local origins = getKomgaOrigins(profiles_mod)
-        if origins[origin:lower()] then
-            return true
-        end
+        return origins[origin:lower()] == true
     end
 
-    -- 2. Fallback check for relative or standard Komga path segments
+    -- 2. Fallback check for relative Komga path segments (ONLY when origin is nil)
     local u_lower = url:lower()
-    if u_lower:find("/opds/v1.2/", 1, true) or u_lower:find("/api/v1/", 1, true) or u_lower:find("/api/v2/", 1, true) then
+    if u_lower:find("^/opds/v1%.2/") or u_lower:find("^/api/v1/") or u_lower:find("^/api/v2/") then
         return true
     end
 
@@ -83,12 +85,19 @@ function M.getAuthHeaders(url, profiles_mod)
     local has_auth_header = type(auth_header) == "string" and auth_header ~= ""
     if not (has_api_key or has_auth_header) then return nil end
 
+    local auth_key = tostring(api_key) .. ":" .. tostring(auth_header)
+    if _cached_auth_headers and _cached_auth_key == auth_key then
+        return _cached_auth_headers
+    end
+
     local headers = {}
     if has_api_key then
         headers["X-API-Key"] = api_key
     elseif has_auth_header then
         headers["Authorization"] = auth_header
     end
+    _cached_auth_headers = headers
+    _cached_auth_key = auth_key
     return headers
 end
 

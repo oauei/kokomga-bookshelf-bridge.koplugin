@@ -738,14 +738,21 @@ local function copy_file(src, dst)
         rf:close()
         return false
     end
-    local data = rf:read("*a")
-    if data then
-        wf:write(data)
-        wf:flush()
+    while true do
+        local chunk = rf:read(65536)
+        if not chunk then break end
+        wf:write(chunk)
     end
+    wf:flush()
     rf:close()
     wf:close()
     return true
+end
+
+local _dir_cover_cache = {}
+
+function M.clearDirectoryCoverCache()
+    _dir_cover_cache = {}
 end
 
 local function getDirectoryCover(filepath)
@@ -753,20 +760,27 @@ local function getDirectoryCover(filepath)
     local dir = filepath:match("^(.*)/[^/]+$")
     if not dir or dir == "" then return nil end
 
+    if _dir_cover_cache[dir] ~= nil then
+        return _dir_cover_cache[dir] or nil
+    end
+
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
     local candidates = { ".cover.jpg", ".cover.png", ".cover.webp", ".cover", "cover.jpg", "cover.png", "folder.jpg" }
     for _, name in ipairs(candidates) do
         local p = dir .. "/" .. name
         if ok_lfs and lfs and lfs.attributes(p, "mode") == "file" then
+            _dir_cover_cache[dir] = p
             return p
         else
             local f = io.open(p, "rb")
             if f then
                 f:close()
+                _dir_cover_cache[dir] = p
                 return p
             end
         end
     end
+    _dir_cover_cache[dir] = false
     return nil
 end
 
@@ -883,6 +897,14 @@ local function hookScreensaverCover(proto)
     if type(proto.applyBookCoverToScreensaver) == "function" then
         local orig_apply = proto.applyBookCoverToScreensaver
         proto.applyBookCoverToScreensaver = function(self_k, target_path)
+            local ok_p, PluginLoader = pcall(require, "pluginloader")
+            local loaded = ok_p and PluginLoader and PluginLoader.loaded_plugins
+            local bcs = loaded and (loaded["boox-cover-sync"] or loaded["boox_cover_sync"])
+            if bcs and bcs.enabled and bcs ~= false then
+                -- boox-cover-sync handles screensaver synchronization directly
+                return
+            end
+
             local ui = self_k.ui
             local filepath = target_path or (ui and ui.document and ui.document.file)
             if filepath and isMangaDocument(ui and ui.document, filepath) then
@@ -1046,6 +1068,10 @@ local function patchSyncTarget(sync_target)
                         return true
                     end
                     return false
+                end
+                if not ret and show_native_func then
+                    show_native_func()
+                    return true
                 end
                 return ret
             end

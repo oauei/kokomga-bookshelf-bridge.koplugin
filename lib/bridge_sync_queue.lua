@@ -105,7 +105,7 @@ function M.enqueue(action_type, book_id, data)
     return true
 end
 
-function M.removeMultiple(book_ids)
+function M.removeMultiple(book_ids, defer_flush)
     if not book_ids or #book_ids == 0 then return false end
     local s = getSettings()
     if not s then return false end
@@ -122,14 +122,16 @@ function M.removeMultiple(book_ids)
     end
     if changed then
         s:saveSetting("queue", q)
-        s:flush()
+        if not defer_flush then
+            s:flush()
+        end
         return true
     end
     return false
 end
 
-function M.remove(book_id)
-    return M.removeMultiple({ book_id })
+function M.remove(book_id, defer_flush)
+    return M.removeMultiple({ book_id }, defer_flush)
 end
 
 function M.clear()
@@ -154,6 +156,30 @@ local function getKomgaApi()
         if ok and Api and Api.instance then return Api.instance end
     end
     return nil
+end
+
+local _cached_frontier_by_series = nil
+local _cached_frontier_time = 0
+
+local function getFrontierBySeries()
+    local now = os.time()
+    if _cached_frontier_by_series and (now - _cached_frontier_time < 10) then
+        return _cached_frontier_by_series
+    end
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    local ok_ls, LuaSettings = pcall(require, "luasettings")
+    if ok_ds and ok_ls and DataStorage and LuaSettings then
+        local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+        if s then
+            local lists = s:readSetting("lists") or {}
+            local aq = lists["active_queue"]
+            local by_series = (aq and aq.items and aq.items.by_series) or {}
+            _cached_frontier_by_series = by_series
+            _cached_frontier_time = now
+            return by_series
+        end
+    end
+    return {}
 end
 
 function M.isServerFurther(server_book, queued_item)
@@ -198,28 +224,20 @@ function M.isServerFurther(server_book, queued_item)
     local raw_series_id = server_book.seriesId
     local series_id = (type(raw_series_id) == "string" or type(raw_series_id) == "number") and raw_series_id or nil
     if series_id then
-        local ok_ds, DataStorage = pcall(require, "datastorage")
-        local ok_ls, LuaSettings = pcall(require, "luasettings")
-        if ok_ds and ok_ls and DataStorage and LuaSettings then
-            local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
-            if s then
-                local lists = s:readSetting("lists") or {}
-                local aq = lists["active_queue"]
-                local frontier_dto = aq and aq.items and aq.items.by_series and aq.items.by_series[tostring(series_id)]
-                if type(frontier_dto) == "table" then
-                    local ok_d, Dedup = pcall(require, "lib/hybrid_dedup")
-                    if ok_d and Dedup and Dedup.extractChapterNumber then
-                        local ok_fn, frontier_num = pcall(Dedup.extractChapterNumber, frontier_dto)
-                        local ok_bn, book_num = pcall(Dedup.extractChapterNumber, server_book)
-                        if not ok_bn or not book_num then
-                            if queued_item.filepath then
-                                ok_bn, book_num = pcall(Dedup.extractChapterNumber, { filepath = queued_item.filepath })
-                            end
-                        end
-                        if ok_fn and ok_bn and frontier_num and book_num and book_num < frontier_num and not q_completed then
-                            return true, string.format("server series frontier chapter %s > queued chapter %s", tostring(frontier_num), tostring(book_num))
-                        end
+        local by_series = getFrontierBySeries()
+        local frontier_dto = by_series and by_series[tostring(series_id)]
+        if type(frontier_dto) == "table" then
+            local ok_d, Dedup = pcall(require, "lib/hybrid_dedup")
+            if ok_d and Dedup and Dedup.extractChapterNumber then
+                local ok_fn, frontier_num = pcall(Dedup.extractChapterNumber, frontier_dto)
+                local ok_bn, book_num = pcall(Dedup.extractChapterNumber, server_book)
+                if not ok_bn or not book_num then
+                    if queued_item.filepath then
+                        ok_bn, book_num = pcall(Dedup.extractChapterNumber, { filepath = queued_item.filepath })
                     end
+                end
+                if ok_fn and ok_bn and frontier_num and book_num and book_num < frontier_num and not q_completed then
+                    return true, string.format("server series frontier chapter %s > queued chapter %s", tostring(frontier_num), tostring(book_num))
                 end
             end
         end
@@ -279,6 +297,8 @@ end
 M.buildApiRequestOpts = buildApiRequestOpts
 
 local function invalidateActiveQueueAndRepo()
+    _cached_frontier_by_series = nil
+    _cached_frontier_time = 0
     pcall(function()
         local DataStorage = require("datastorage")
         local LuaSettings = require("luasettings")
@@ -390,6 +410,13 @@ function M.flush(api, on_complete)
     local use_async_http = has_ui and ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable()
 
     local function finish_flush()
+        if pushed_cnt > 0 or pruned_cnt > 0 then
+            local s = getSettings()
+            if s and s.flush then
+                pcall(function() s:flush() end)
+            end
+            invalidateActiveQueueAndRepo()
+        end
         M._flushing = false
         M._flushing_started_at = nil
         if pushed_cnt > 0 or pruned_cnt > 0 then
@@ -441,7 +468,7 @@ function M.flush(api, on_complete)
 
         local function handlePushResult(success, err, is_unreachable)
             if success then
-                M.remove(book_id)
+                M.remove(book_id, true)
                 pushed_cnt = pushed_cnt + 1
                 logger.info(string.format("[Bridge SyncQueue] Flushed book %s (page=%s, completed=%s)",
                     tostring(book_id),
@@ -461,7 +488,7 @@ function M.flush(api, on_complete)
                     finish_flush()
                 else
                     logger.warn(string.format("[Bridge SyncQueue] Dropping book %s from queue after client error: %s", tostring(book_id), tostring(err)))
-                    M.remove(book_id)
+                    M.remove(book_id, true)
                     pruned_cnt = pruned_cnt + 1
                     scheduleNext()
                 end
@@ -517,7 +544,7 @@ function M.flush(api, on_complete)
             if server_further then
                 logger.info(string.format("[Bridge SyncQueue] Server progress is further for book %s (%s). Dropping stale queued update.",
                     tostring(book_id), tostring(reason)))
-                M.remove(book_id)
+                M.remove(book_id, true)
                 pruned_cnt = pruned_cnt + 1
                 scheduleNext()
             else
@@ -564,7 +591,10 @@ function M.flush(api, on_complete)
     end
 
     step(1)
-    return true
+    if unreachable_encountered then
+        return false, failure_reason or "Server unreachable"
+    end
+    return true, (pushed_cnt + pruned_cnt)
 end
 
 return M
