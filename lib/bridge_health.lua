@@ -174,17 +174,22 @@ function M.isServerReachable(url, force_probe)
     if ok_net and NetworkMgr then
         if NetworkMgr.isConnected then
             if not NetworkMgr:isConnected() then
+                logger.info("[Bridge Health] isServerReachable=false: NetworkMgr:isConnected() is false")
                 return false, "Network offline"
             end
         elseif NetworkMgr.isOnline and not NetworkMgr:isOnline() then
+            logger.info("[Bridge Health] isServerReachable=false: NetworkMgr:isOnline() is false")
             return false, "Network offline"
         end
     end
 
     -- 2. Check if circuit breaker is tripped
-    local is_active, reason = M.isCircuitBreakerActive()
-    if is_active then
-        return false, "Circuit breaker active: " .. tostring(reason)
+    if not force_probe then
+        local is_active, reason = M.isCircuitBreakerActive()
+        if is_active then
+            logger.info("[Bridge Health] isServerReachable=false: circuit breaker active (" .. tostring(reason) .. ")")
+            return false, "Circuit breaker active: " .. tostring(reason)
+        end
     end
 
     local now = os.time()
@@ -259,7 +264,7 @@ function M.isServerReachable(url, force_probe)
 
     M._last_checked_at = now
     if probe_ok then
-        M._is_reachable = true
+        M.reportSuccess()
         return true
     else
         M.tripCircuitBreaker(probe_err or "Probe failed")
