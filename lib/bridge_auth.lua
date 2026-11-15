@@ -112,8 +112,14 @@ function M.installInterceptor(profiles_mod)
             if type(reqt) == "table" and reqt.url then
                 if not Health.isInSubprocess() then
                     local ok_net, NetworkMgr = pcall(require, "ui/network/manager")
-                    if ok_net and NetworkMgr and NetworkMgr.isConnected and not NetworkMgr:isConnected() then
-                        return nil, "Network offline"
+                    if ok_net and NetworkMgr then
+                        if NetworkMgr.isConnected then
+                            if not NetworkMgr:isConnected() then
+                                return nil, "Network offline"
+                            end
+                        elseif NetworkMgr.isOnline and not NetworkMgr:isOnline() then
+                            return nil, "Network offline"
+                        end
                     end
                 end
 

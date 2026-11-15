@@ -1162,8 +1162,12 @@ end
 
 local function isNetworkOffline()
     local ok_nm, NetworkMgr = pcall(require, "ui/network/manager")
-    if ok_nm and NetworkMgr and NetworkMgr.isConnected then
-        return not NetworkMgr:isConnected()
+    if ok_nm and NetworkMgr then
+        if NetworkMgr.isConnected then
+            return not NetworkMgr:isConnected()
+        elseif NetworkMgr.isOnline then
+            return not NetworkMgr:isOnline()
+        end
     end
     return false
 end

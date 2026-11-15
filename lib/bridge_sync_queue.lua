@@ -415,7 +415,6 @@ function M.flush(api, on_complete)
             if s and s.flush then
                 pcall(function() s:flush() end)
             end
-            invalidateActiveQueueAndRepo()
         end
         M._flushing = false
         M._flushing_started_at = nil

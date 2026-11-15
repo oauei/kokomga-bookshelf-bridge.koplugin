@@ -171,8 +171,14 @@ end
 function M.isServerReachable(url, force_probe)
     -- 1. Check if device has any network connection (avoid blocking DNS in NetworkMgr:isOnline)
     local ok_net, NetworkMgr = pcall(require, "ui/network/manager")
-    if ok_net and NetworkMgr and NetworkMgr.isConnected and not NetworkMgr:isConnected() then
-        return false, "Network offline"
+    if ok_net and NetworkMgr then
+        if NetworkMgr.isConnected then
+            if not NetworkMgr:isConnected() then
+                return false, "Network offline"
+            end
+        elseif NetworkMgr.isOnline and not NetworkMgr:isOnline() then
+            return false, "Network offline"
+        end
     end
 
     -- 2. Check if circuit breaker is tripped
