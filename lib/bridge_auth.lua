@@ -13,6 +13,8 @@ end
 
 local _komga_origins = nil
 local _komga_origins_time = 0
+local _cached_auth_headers = nil
+local _cached_auth_key = nil
 local ORIGINS_TTL = 30
 
 local function getKomgaOrigins(profiles_mod)
@@ -49,6 +51,8 @@ end
 function M.invalidateOrigins()
     _komga_origins = nil
     _komga_origins_time = 0
+    _cached_auth_headers = nil
+    _cached_auth_key = nil
 end
 
 function M.isKomgaUrl(url, profiles_mod)
@@ -58,14 +62,12 @@ function M.isKomgaUrl(url, profiles_mod)
     local origin = url:match("^(https?://[^/]+)")
     if origin then
         local origins = getKomgaOrigins(profiles_mod)
-        if origins[origin:lower()] then
-            return true
-        end
+        return origins[origin:lower()] == true
     end
 
-    -- 2. Fallback check for relative or standard Komga path segments
+    -- 2. Fallback check for relative Komga path segments (ONLY when origin is nil)
     local u_lower = url:lower()
-    if u_lower:find("/opds/v1.2/", 1, true) or u_lower:find("/api/v1/", 1, true) or u_lower:find("/api/v2/", 1, true) then
+    if u_lower:find("^/opds/v1%.2/") or u_lower:find("^/api/v1/") or u_lower:find("^/api/v2/") then
         return true
     end
 
@@ -83,12 +85,19 @@ function M.getAuthHeaders(url, profiles_mod)
     local has_auth_header = type(auth_header) == "string" and auth_header ~= ""
     if not (has_api_key or has_auth_header) then return nil end
 
+    local auth_key = tostring(api_key) .. ":" .. tostring(auth_header)
+    if _cached_auth_headers and _cached_auth_key == auth_key then
+        return _cached_auth_headers
+    end
+
     local headers = {}
     if has_api_key then
         headers["X-API-Key"] = api_key
     elseif has_auth_header then
         headers["Authorization"] = auth_header
     end
+    _cached_auth_headers = headers
+    _cached_auth_key = auth_key
     return headers
 end
 
@@ -98,113 +107,79 @@ function M.installInterceptor(profiles_mod)
 
     local Health = require("lib/bridge_health")
 
+    local function wrapRequest(orig_fn, mod_tbl)
+        return function(reqt, ...)
+            if type(reqt) == "table" and reqt.url then
+                if not Health.isInSubprocess() then
+                    local ok_net, NetworkMgr = pcall(require, "ui/network/manager")
+                    if ok_net and NetworkMgr and NetworkMgr.isOnline and not NetworkMgr:isOnline() then
+                        return nil, "Network offline"
+                    end
+                end
+
+                if M.isKomgaUrl(reqt.url, profiles_mod) then
+                    local active, reason = Health.isCircuitBreakerActive()
+                    if active then
+                        logger.info("[Bridge Auth] Fast-failing Komga request (circuit breaker active): " .. tostring(reason))
+                        return nil, "Komga server unreachable (circuit breaker active)"
+                    end
+
+                    local extra = M.getAuthHeaders(reqt.url, profiles_mod)
+                    if extra then
+                        reqt.headers = reqt.headers or {}
+                        for k, v in pairs(extra) do
+                            if not reqt.headers[k] then
+                                reqt.headers[k] = v
+                            end
+                        end
+                    end
+
+                    local is_main = not Health.isInSubprocess()
+                    local ok_su, socketutil = pcall(require, "socketutil")
+                    local max_t = Health.MAIN_THREAD_MAX_TIMEOUT or 1.5
+                    if is_main then
+                        if reqt.timeout and reqt.timeout > max_t then
+                            reqt.timeout = max_t
+                        end
+                        if ok_su and socketutil and socketutil.set_timeout then
+                            pcall(socketutil.set_timeout, socketutil, max_t, max_t)
+                        else
+                            mod_tbl.TIMEOUT = max_t
+                        end
+                    end
+
+                    local res, code, headers, status = orig_fn(reqt, ...)
+
+                    if is_main and ok_su and socketutil and socketutil.reset_timeout then
+                        pcall(function() socketutil:reset_timeout() end)
+                    end
+
+                    local num_code = tonumber(code)
+                    if res or (num_code and num_code >= 200 and num_code < 500) then
+                        Health.reportSuccess()
+                    else
+                        local is_thumb = reqt.url:find("/thumbnail", 1, true) ~= nil
+                        Health.reportFailure(code or status or "Network error", { is_thumbnail = is_thumb })
+                    end
+
+                    return res, code, headers, status
+                end
+            end
+            return orig_fn(reqt, ...)
+        end
+    end
+
     -- 1. Hook socket.http
     local ok_http, http = pcall(require, "socket.http")
     if ok_http and http and http.request then
-        local orig_http = http.request
-        http.request = function(reqt, ...)
-            if type(reqt) == "table" and reqt.url and M.isKomgaUrl(reqt.url, profiles_mod) then
-                local active, reason = Health.isCircuitBreakerActive()
-                if active then
-                    logger.info("[Bridge Auth] Fast-failing Komga request (circuit breaker active): " .. tostring(reason))
-                    return nil, "Komga server unreachable (circuit breaker active)"
-                end
-
-                local extra = M.getAuthHeaders(reqt.url, profiles_mod)
-                if extra then
-                    reqt.headers = reqt.headers or {}
-                    for k, v in pairs(extra) do
-                        if not reqt.headers[k] then
-                            reqt.headers[k] = v
-                        end
-                    end
-                end
-
-                local is_main = not Health.isInSubprocess()
-                local ok_su, socketutil = pcall(require, "socketutil")
-                if is_main then
-                    if reqt.timeout and reqt.timeout > Health.MAIN_THREAD_MAX_TIMEOUT then
-                        reqt.timeout = Health.MAIN_THREAD_MAX_TIMEOUT
-                    end
-                    if ok_su and socketutil and socketutil.set_timeout then
-                        pcall(socketutil.set_timeout, socketutil, 1.0, Health.MAIN_THREAD_MAX_TIMEOUT)
-                    else
-                        http.TIMEOUT = 1.0
-                    end
-                end
-
-                local res, code, headers, status = orig_http(reqt, ...)
-
-                if is_main and ok_su and socketutil and socketutil.reset_timeout then
-                    pcall(function() socketutil:reset_timeout() end)
-                end
-
-                local num_code = tonumber(code)
-                if res or (num_code and num_code >= 200 and num_code < 500) then
-                    Health.reportSuccess()
-                else
-                    Health.reportFailure(code or status or "Network error")
-                end
-
-                return res, code, headers, status
-            end
-            return orig_http(reqt, ...)
-        end
+        http.request = wrapRequest(http.request, http)
         logger.info("[Bridge] Hooked socket.http.request for Komga authentication and ANR protection")
     end
 
     -- 2. Hook ssl.https
     local ok_https, https = pcall(require, "ssl.https")
     if ok_https and https and https.request then
-        local orig_https = https.request
-        https.request = function(reqt, ...)
-            if type(reqt) == "table" and reqt.url and M.isKomgaUrl(reqt.url, profiles_mod) then
-                local active, reason = Health.isCircuitBreakerActive()
-                if active then
-                    logger.info("[Bridge Auth] Fast-failing Komga request (circuit breaker active): " .. tostring(reason))
-                    return nil, "Komga server unreachable (circuit breaker active)"
-                end
-
-                local extra = M.getAuthHeaders(reqt.url, profiles_mod)
-                if extra then
-                    reqt.headers = reqt.headers or {}
-                    for k, v in pairs(extra) do
-                        if not reqt.headers[k] then
-                            reqt.headers[k] = v
-                        end
-                    end
-                end
-
-                local is_main = not Health.isInSubprocess()
-                local ok_su, socketutil = pcall(require, "socketutil")
-                if is_main then
-                    if reqt.timeout and reqt.timeout > Health.MAIN_THREAD_MAX_TIMEOUT then
-                        reqt.timeout = Health.MAIN_THREAD_MAX_TIMEOUT
-                    end
-                    if ok_su and socketutil and socketutil.set_timeout then
-                        pcall(socketutil.set_timeout, socketutil, 1.0, Health.MAIN_THREAD_MAX_TIMEOUT)
-                    else
-                        https.TIMEOUT = 1.0
-                    end
-                end
-
-                local res, code, headers, status = orig_https(reqt, ...)
-
-                if is_main and ok_su and socketutil and socketutil.reset_timeout then
-                    pcall(function() socketutil:reset_timeout() end)
-                end
-
-                local num_code = tonumber(code)
-                if res or (num_code and num_code >= 200 and num_code < 500) then
-                    Health.reportSuccess()
-                else
-                    Health.reportFailure(code or status or "Network error")
-                end
-
-                return res, code, headers, status
-            end
-            return orig_https(reqt, ...)
-        end
+        https.request = wrapRequest(https.request, https)
         logger.info("[Bridge] Hooked ssl.https.request for Komga authentication and ANR protection")
     end
 end

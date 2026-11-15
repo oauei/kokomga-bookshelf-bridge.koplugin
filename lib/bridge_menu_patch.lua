@@ -337,11 +337,39 @@ function M.patchKokomgaMenu(profiles_mod)
                             end,
                         }
 
+                        local long_strip_item = {
+                            text = _("Auto Long-Strip Scroll Mode"),
+                            help_text = _("Automatically enables continuous vertical scrolling, fit-to-content-width zoom, and LTR order for long-strip/webtoon comics without affecting normal manga."),
+                            checked_func = function()
+                                if G_reader_settings and G_reader_settings.readSetting then
+                                    return G_reader_settings:readSetting("bridge_auto_long_strip") ~= false
+                                end
+                                return true
+                            end,
+                            keep_menu_open = true,
+                            callback = function(touchmenu_instance)
+                                local curr = true
+                                if G_reader_settings and G_reader_settings.readSetting then
+                                    curr = G_reader_settings:readSetting("bridge_auto_long_strip") ~= false
+                                end
+                                local new_val = not curr
+                                if G_reader_settings then
+                                    G_reader_settings:saveSetting("bridge_auto_long_strip", new_val)
+                                    pcall(function() G_reader_settings:flush() end)
+                                end
+                                if touchmenu_instance and touchmenu_instance.updateItems then
+                                    touchmenu_instance:updateItems()
+                                end
+                            end,
+                        }
+
                         if rtl_idx then
                             table.insert(sub_items, rtl_idx + 1, adv_item)
-                            table.insert(sub_items, rtl_idx + 2, defer_item)
+                            table.insert(sub_items, rtl_idx + 2, long_strip_item)
+                            table.insert(sub_items, rtl_idx + 3, defer_item)
                         else
                             table.insert(sub_items, adv_item)
+                            table.insert(sub_items, long_strip_item)
                             table.insert(sub_items, defer_item)
                         end
                         return sub_items
@@ -709,14 +737,21 @@ local function copy_file(src, dst)
         rf:close()
         return false
     end
-    local data = rf:read("*a")
-    if data then
-        wf:write(data)
-        wf:flush()
+    while true do
+        local chunk = rf:read(65536)
+        if not chunk then break end
+        wf:write(chunk)
     end
+    wf:flush()
     rf:close()
     wf:close()
     return true
+end
+
+local _dir_cover_cache = {}
+
+function M.clearDirectoryCoverCache()
+    _dir_cover_cache = {}
 end
 
 local function getDirectoryCover(filepath)
@@ -724,20 +759,27 @@ local function getDirectoryCover(filepath)
     local dir = filepath:match("^(.*)/[^/]+$")
     if not dir or dir == "" then return nil end
 
+    if _dir_cover_cache[dir] ~= nil then
+        return _dir_cover_cache[dir] or nil
+    end
+
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
     local candidates = { ".cover.jpg", ".cover.png", ".cover.webp", ".cover", "cover.jpg", "cover.png", "folder.jpg" }
     for _, name in ipairs(candidates) do
         local p = dir .. "/" .. name
         if ok_lfs and lfs and lfs.attributes(p, "mode") == "file" then
+            _dir_cover_cache[dir] = p
             return p
         else
             local f = io.open(p, "rb")
             if f then
                 f:close()
+                _dir_cover_cache[dir] = p
                 return p
             end
         end
     end
+    _dir_cover_cache[dir] = false
     return nil
 end
 
@@ -854,6 +896,14 @@ local function hookScreensaverCover(proto)
     if type(proto.applyBookCoverToScreensaver) == "function" then
         local orig_apply = proto.applyBookCoverToScreensaver
         proto.applyBookCoverToScreensaver = function(self_k, target_path)
+            local ok_p, PluginLoader = pcall(require, "pluginloader")
+            local loaded = ok_p and PluginLoader and PluginLoader.loaded_plugins
+            local bcs = loaded and (loaded["boox-cover-sync"] or loaded["boox_cover_sync"])
+            if bcs and bcs.enabled and bcs ~= false then
+                -- boox-cover-sync handles screensaver synchronization directly
+                return
+            end
+
             local ui = self_k.ui
             local filepath = target_path or (ui and ui.document and ui.document.file)
             if filepath and isMangaDocument(ui and ui.document, filepath) then
@@ -890,12 +940,20 @@ function M.patchKokomgaAutoRtl()
         ReaderPaging.onReaderReady = function(self_rp, ...)
             if orig_rp_ready then orig_rp_ready(self_rp, ...) end
             M.handleAutoRtlAdvanced(self_rp.ui)
+            local ok_ls, LongStrip = pcall(require, "lib/bridge_long_strip")
+            if ok_ls and LongStrip and LongStrip.applyIfNeeded then
+                LongStrip.applyIfNeeded(self_rp.ui)
+            end
         end
     end
 
     local ok_r, ReaderUI = pcall(require, "apps/reader/readerui")
     if ok_r and ReaderUI and ReaderUI.instance then
         M.handleAutoRtlAdvanced(ReaderUI.instance)
+        local ok_ls, LongStrip = pcall(require, "lib/bridge_long_strip")
+        if ok_ls and LongStrip and LongStrip.applyIfNeeded then
+            LongStrip.applyIfNeeded(ReaderUI.instance)
+        end
     end
 
     -- 2. Scan loaded plugins for kokomga prototype
@@ -1009,6 +1067,10 @@ local function patchSyncTarget(sync_target)
                         return true
                     end
                     return false
+                end
+                if not ret and show_native_func then
+                    show_native_func()
+                    return true
                 end
                 return ret
             end
