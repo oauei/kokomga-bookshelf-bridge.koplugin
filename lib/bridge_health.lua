@@ -6,6 +6,18 @@
 local logger = require("logger")
 local os = require("os")
 
+local ok_ffi, ffi = pcall(require, "ffi")
+if ok_ffi and ffi then
+    pcall(ffi.cdef, "int getpid(void);")
+end
+local PARENT_PID = nil
+if ok_ffi and ffi then
+    local ok_p, pid = pcall(function() return ffi.C.getpid() end)
+    if ok_p and pid then
+        PARENT_PID = pid
+    end
+end
+
 local M = {
     _breaker_until = 0,
     _breaker_reason = nil,
@@ -63,7 +75,14 @@ function M.setInSubprocess(val)
 end
 
 function M.isInSubprocess()
-    return M._in_subprocess
+    if M._in_subprocess then return true end
+    if PARENT_PID and ok_ffi and ffi then
+        local ok_p, pid = pcall(function() return ffi.C.getpid() end)
+        if ok_p and pid and pid ~= PARENT_PID then
+            return true
+        end
+    end
+    return false
 end
 
 function M.isCircuitBreakerActive()
@@ -170,16 +189,19 @@ end
 
 function M.isServerReachable(url, force_probe)
     -- 1. Check if device has any network connection (avoid blocking DNS in NetworkMgr:isOnline)
-    local ok_net, NetworkMgr = pcall(require, "ui/network/manager")
-    if ok_net and NetworkMgr then
-        if NetworkMgr.isConnected then
-            if not NetworkMgr:isConnected() then
-                logger.info("[Bridge Health] isServerReachable=false: NetworkMgr:isConnected() is false")
+    -- Never call NetworkMgr/JNI in a forked subprocess (Android ART aborts on AttachCurrentThread).
+    if not M.isInSubprocess() then
+        local ok_net, NetworkMgr = pcall(require, "ui/network/manager")
+        if ok_net and NetworkMgr then
+            if NetworkMgr.isConnected then
+                if not NetworkMgr:isConnected() then
+                    logger.info("[Bridge Health] isServerReachable=false: NetworkMgr:isConnected() is false")
+                    return false, "Network offline"
+                end
+            elseif NetworkMgr.isOnline and not NetworkMgr:isOnline() then
+                logger.info("[Bridge Health] isServerReachable=false: NetworkMgr:isOnline() is false")
                 return false, "Network offline"
             end
-        elseif NetworkMgr.isOnline and not NetworkMgr:isOnline() then
-            logger.info("[Bridge Health] isServerReachable=false: NetworkMgr:isOnline() is false")
-            return false, "Network offline"
         end
     end
 
