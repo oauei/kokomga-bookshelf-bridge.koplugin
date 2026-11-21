@@ -199,8 +199,8 @@ function M.requestAsync(opts, callback)
         or ("rm -f " .. q_cfg)
 
     local cmd = string.format(
-        '(echo $$ > %s; %s -K %s > %s 2>/dev/null; rc=$?; printf "\\nCURL_RC=%%d\\n" "$rc" >> %s; %s; mv %s %s) >/dev/null 2>&1 &',
-        q_pid, q_curl, q_cfg, q_meta, q_meta, bg_rm, q_meta, q_done
+        '(echo $$ > %s; hc=$(%s -K %s 2>/dev/null); rc=$?; printf "%%s\\nCURL_RC=%%d\\n" "$hc" "$rc" > %s; %s; mv %s %s) >/dev/null 2>&1 &',
+        q_pid, q_curl, q_cfg, q_meta, bg_rm, q_meta, q_done
     )
     local exec_res = os.execute(cmd)
     if exec_res == false or (type(exec_res) == "number" and exec_res ~= 0) then
@@ -236,8 +236,8 @@ function M.requestAsync(opts, callback)
                 else
                     err_msg = (code == 0) and "Network timeout" or ("HTTP " .. tostring(code))
                 end
-                logger.warn(string.format("[BridgeAsyncHttp] request failed: method=%s code=%s curl_rc=%s err=%s meta=%q",
-                    tostring(method), tostring(code), tostring(curl_rc), tostring(err_msg), tostring(meta_str)))
+                logger.warn(string.format("[BridgeAsyncHttp] request failed: method=%s code=%s curl_rc=%s err=%s",
+                    tostring(method), tostring(code), tostring(curl_rc), tostring(err_msg)))
             end
             if not opts.skip_health then
                 reportHealth(ok and code or (curl_rc ~= 0 and 0 or code), err_msg, health_opts)
