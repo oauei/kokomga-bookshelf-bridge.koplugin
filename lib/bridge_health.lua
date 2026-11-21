@@ -28,6 +28,7 @@ local M = {
     _in_subprocess = false,
     _dns_cache = {},
     _async_probe_in_flight = false,
+    _probe_gen = 0,
     COOLDOWN_SECONDS = 20,
     CACHE_VALID_SECONDS = 15,
     DNS_CACHE_TTL = 300,
@@ -58,10 +59,23 @@ function M.setCachedIp(host, ip)
 end
 
 local function parseUrl(url)
-    if type(url) ~= "string" or url == "" then return nil, nil, nil end
-    local scheme, host, port = url:match("^(https?)://([^:/]+):?(%d*)")
-    if not host then return nil, nil end
-    port = tonumber(port)
+    if type(url) ~= "string" or url == "" or url:find("[%z\r\n]") then return nil, nil, nil end
+    local scheme, rest = url:match("^([%a][%w+.-]*)://(.+)$")
+    if not scheme then return nil, nil, nil end
+    scheme = scheme:lower()
+    if scheme ~= "http" and scheme ~= "https" then return nil, nil, nil end
+    local authority = rest:match("^([^/?#]+)")
+    if not authority or authority == "" or authority:find("@", 1, true) or authority:find("\\", 1, true) then
+        return nil, nil, nil
+    end
+    local host, port_str
+    if authority:sub(1, 1) == "[" then
+        host, port_str = authority:match("^%[([^%]]+)%]:?(%d*)$")
+    else
+        host, port_str = authority:match("^([^:]+):?(%d*)$")
+    end
+    if not host or host == "" then return nil, nil, nil end
+    local port = tonumber(port_str)
     if not port then
         port = (scheme == "https") and 443 or 80
     end
@@ -109,6 +123,8 @@ function M.resetCircuitBreaker()
     M._is_reachable = true
     M._failure_count = 0
     M._timeout_failures = 0
+    M._probe_gen = (M._probe_gen or 0) + 1
+    M._async_probe_in_flight = false
     logger.info("[Bridge Health] Circuit breaker reset.")
 end
 
@@ -124,12 +140,11 @@ end
 
 function M.reportFailure(err, opts)
     local err_str = tostring(err):lower()
-    local is_timeout = err_str:find("timeout") ~= nil
+    local is_timeout = err_str:find("timeout") ~= nil or err_str:find("timed out") ~= nil
     local is_hard_unreachable = err_str:find("refused") ~= nil
         or err_str:find("host not found") ~= nil
         or err_str:find("unreachable") ~= nil
         or err_str:find("no route") ~= nil
-        or err_str:find("closed") ~= nil
         or err_str:find("network is down") ~= nil
         or err_str:find("network unreachable") ~= nil
 
@@ -154,11 +169,11 @@ function M.getActiveServerUrl(profiles_mod)
         local profiles = profiles_mod.getProfiles()
         if type(profiles) == "table" then
             for _, p in ipairs(profiles) do
-                if p.active and p.base_url and p.base_url ~= "" then
+                if p.active and type(p.base_url) == "string" and p.base_url ~= "" then
                     return p.base_url
                 end
             end
-            if profiles[1] and profiles[1].base_url then
+            if profiles[1] and type(profiles[1].base_url) == "string" and profiles[1].base_url ~= "" then
                 return profiles[1].base_url
             end
         end
@@ -179,6 +194,7 @@ function M.patchNetworkMgrOnline()
     end
     NetworkMgr._bridge_is_online_patched = true
     NetworkMgr.isOnline = function(self_nm)
+        if M.isInSubprocess() then return true end
         if self_nm and self_nm.isConnected then
             return self_nm:isConnected()
         end
@@ -220,15 +236,14 @@ function M.isServerReachable(url, force_probe)
     end
 
     -- 3. Perform fast socket probe if host is available
-    if not url then
+    if url == nil then
         local ok_pr, Profiles = pcall(require, "lib/bridge_profiles")
         url = M.getActiveServerUrl(ok_pr and Profiles)
+        if not url then return true end
     end
 
-    if not url then return true end
-
     local host, port = parseUrl(url)
-    if not host then return true end
+    if not host then return false, "Invalid server URL" end
 
     local target_ip = M.getCachedIp(host)
     if not target_ip and not M.isInSubprocess() then
@@ -238,6 +253,7 @@ function M.isServerReachable(url, force_probe)
         if ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable() then
             if not M._async_probe_in_flight then
                 M._async_probe_in_flight = true
+                local probe_gen = M._probe_gen
                 local probe_url = url:gsub("/+$", "") .. "/api/v1/books?size=1"
                 AsyncHttp.requestAsync({
                     url = probe_url,
@@ -246,10 +262,11 @@ function M.isServerReachable(url, force_probe)
                     max_time = 2,
                     skip_health = true,
                 }, function(ok, code, _, err_msg)
+                    if M._probe_gen ~= probe_gen then return end
                     M._async_probe_in_flight = false
                     M._last_checked_at = os.time()
                     local num_code = tonumber(code) or 0
-                    if ok or (num_code >= 200 and num_code < 500) then
+                    if ok or num_code == 401 or (num_code >= 200 and num_code < 400) then
                         M.reportSuccess()
                     else
                         M.tripCircuitBreaker(err_msg or "Async probe failed")
@@ -258,7 +275,10 @@ function M.isServerReachable(url, force_probe)
             end
             return M._is_reachable, M._is_reachable and nil or "Server unreachable (cached)"
         end
-        -- If curl is unavailable, avoid blocking main thread with raw hostname connect
+        -- If curl is unavailable, recover optimistically after cooldown expiry instead of sticking false forever
+        if not M._is_reachable and not M.isCircuitBreakerActive() then
+            M._is_reachable = true
+        end
         M._last_checked_at = now
         return M._is_reachable
     end
@@ -270,7 +290,7 @@ function M.isServerReachable(url, force_probe)
     if ok_sock and socket and socket.tcp then
         local ok_call, s = pcall(socket.tcp)
         if ok_call and s then
-            pcall(s.settimeout, s, M.PROBE_TIMEOUT or 0.25)
+            pcall(s.settimeout, s, M.PROBE_TIMEOUT or 0.5)
             local res, err = s:connect(target_ip or host, port)
             pcall(s.close, s)
             if res then
@@ -278,6 +298,9 @@ function M.isServerReachable(url, force_probe)
             else
                 probe_err = err or "Connection failed"
             end
+        else
+            -- Local socket creation failure (e.g. EMFILE) should not falsely trip server circuit breaker
+            return M._is_reachable, nil
         end
     else
         -- If socket.tcp is unavailable in current runtime, rely on HTTP error tracking

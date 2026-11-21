@@ -5,6 +5,12 @@ local logger = require("logger")
 
 local M = {}
 
+local function isValidId(id)
+    if type(id) ~= "string" and type(id) ~= "number" then return false end
+    local s = tostring(id)
+    return s ~= "" and #s <= 128 and s:match("^[%w%-_]+$") ~= nil
+end
+
 local function patchPrefetchTarget(cache_tbl)
     if not (cache_tbl and type(cache_tbl) == "table" and type(cache_tbl.prefetchCovers) == "function") then
         return
@@ -15,12 +21,21 @@ local function patchPrefetchTarget(cache_tbl)
     local orig_prefetch = cache_tbl.prefetchCovers
     cache_tbl.prefetchCovers = function(self_c, item_list, type_label)
         if not item_list or #item_list == 0 then return end
+        if type_label ~= "series" and type_label ~= "book" then
+            logger.warn("[Bridge Cache] prefetchCovers rejected invalid type_label: " .. tostring(type_label))
+            return
+        end
 
         local ok_ah, AsyncHttp = pcall(require, "lib/bridge_async_http")
         local ok_ui, UIManager = pcall(require, "ui/uimanager")
         if not (ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable()
                 and ok_ui and UIManager and UIManager.scheduleIn) then
             return orig_prefetch(self_c, item_list, type_label)
+        end
+
+        local ok_h, Health = pcall(require, "lib/bridge_health")
+        if ok_h and Health and Health.isCircuitBreakerActive and Health.isCircuitBreakerActive() then
+            return
         end
 
         pcall(self_c.ensureStructure, self_c)
@@ -36,8 +51,9 @@ local function patchPrefetchTarget(cache_tbl)
 
         local to_download = {}
         for _, item in ipairs(item_list) do
-            if item and item.id then
-                local cache_key = tostring(type_label) .. "_" .. tostring(item.id)
+            if item and isValidId(item.id) then
+                local id_str = tostring(item.id)
+                local cache_key = type_label .. "_" .. id_str
                 local local_path = covers_dir .. "/" .. cache_key .. ".jpg"
                 local f = io.open(local_path, "rb")
                 local exists = (f ~= nil)
@@ -45,7 +61,7 @@ local function patchPrefetchTarget(cache_tbl)
                 local needs_dl = not exists or (not never_update and covers_map[cache_key] ~= item.lastModified)
                 if needs_dl then
                     to_download[#to_download + 1] = {
-                        id = item.id,
+                        id = id_str,
                         lastModified = item.lastModified,
                         cache_key = cache_key,
                         dest_path = local_path,
@@ -65,8 +81,8 @@ local function patchPrefetchTarget(cache_tbl)
         local endpoint_type = (type_label == "series") and "series" or "books"
         local headers = {}
         if api.get_headers then
-            local ok_h, h = pcall(api.get_headers, api)
-            if ok_h and type(h) == "table" then
+            local ok_hdr, h = pcall(api.get_headers, api)
+            if ok_hdr and type(h) == "table" then
                 for k, v in pairs(h) do headers[k] = v end
             end
         end
@@ -74,15 +90,31 @@ local function patchPrefetchTarget(cache_tbl)
         logger.info(string.format("[Bridge Cache] Async pre-fetching %d covers for %s", #to_download, tostring(type_label)))
 
         local idx = 1
+        local dirty = false
+        local function flushSettings()
+            if dirty and self_c.plugin and self_c.plugin.saveSettings then
+                dirty = false
+                pcall(self_c.plugin.saveSettings, self_c.plugin)
+            end
+        end
+
         local function stepNext()
-            if idx > #to_download then return end
+            if idx > #to_download then
+                flushSettings()
+                return
+            end
             local ok_net, NetworkMgr = pcall(require, "ui/network/manager")
             if ok_net and NetworkMgr and NetworkMgr.isConnected and not NetworkMgr:isConnected() then
+                flushSettings()
+                return
+            end
+            if ok_h and Health and Health.isCircuitBreakerActive and Health.isCircuitBreakerActive() then
+                flushSettings()
                 return
             end
             local entry = to_download[idx]
             idx = idx + 1
-            local url = tostring(base_url):gsub("/+$", "") .. "/api/v1/" .. endpoint_type .. "/" .. tostring(entry.id) .. "/thumbnail"
+            local url = tostring(base_url):gsub("/+$", "") .. "/api/v1/" .. endpoint_type .. "/" .. entry.id .. "/thumbnail"
             AsyncHttp.downloadAsync({
                 url = url,
                 headers = headers,
@@ -90,15 +122,20 @@ local function patchPrefetchTarget(cache_tbl)
                 dest_path = entry.dest_path,
                 connect_timeout = 2,
                 max_time = 8,
-            }, function(ok)
+                is_thumbnail = true,
+                skip_health = true,
+            }, function(ok, code, _, err_msg)
                 if ok and meta_cache and meta_cache.covers then
                     meta_cache.covers[entry.cache_key] = entry.lastModified
-                    if self_c.plugin and self_c.plugin.saveSettings then
-                        pcall(self_c.plugin.saveSettings, self_c.plugin)
-                    end
+                    dirty = true
+                elseif not ok then
+                    logger.warn(string.format("[Bridge Cache] cover prefetch failed for %s: code=%s err=%s",
+                        entry.cache_key, tostring(code), tostring(err_msg)))
                 end
                 if idx <= #to_download then
                     UIManager:scheduleIn(0.15, stepNext)
+                else
+                    flushSettings()
                 end
             end)
         end
@@ -135,7 +172,6 @@ end
 
 function M.installCacheHook(profiles_mod)
     if M._installed then return end
-    M._installed = true
 
     installPrefetchHook()
 
@@ -143,6 +179,7 @@ function M.installCacheHook(profiles_mod)
     if not (ok_c and OpdsCovers and OpdsCovers.cachedPath) then
         return
     end
+    M._installed = true
 
     local orig_cachedPath = OpdsCovers.cachedPath
     OpdsCovers.cachedPath = function(rec)

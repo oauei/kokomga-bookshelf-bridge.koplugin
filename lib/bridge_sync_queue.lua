@@ -9,8 +9,33 @@ local os = require("os")
 local M = {
     _flushing = false,
     _flushing_started_at = nil,
+    _flush_gen = 0,
     _settings_file = "kokomga_sync_queue.lua",
 }
+
+local function isFiniteNumber(v)
+    return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
+end
+
+local function isPermanentClientError(code)
+    local n = tonumber(code)
+    return n == 400 or n == 404 or n == 409 or n == 410 or n == 422
+end
+
+local function isTransientOrUnreachable(err, is_unreachable, code)
+    if is_unreachable then return true end
+    local n = tonumber(code)
+    if n then
+        if n == 0 or n == 401 or n == 403 or n == 408 or n == 429 or n >= 500 then
+            return true
+        end
+    end
+    local s = tostring(err or ""):lower()
+    for _, pat in ipairs({ "timeout", "timed out", "unreachable", "refused", "closed", "reset", "no route", "host not found", "network is down", "502", "503", "504", "429", "401" }) do
+        if s:find(pat, 1, true) then return true end
+    end
+    return false
+end
 
 local function getSettings()
     if M._flushing and M._flush_settings and M._flush_settings_file == M._settings_file then
@@ -33,7 +58,11 @@ end
 local function normalizeBookId(book_id)
     if type(book_id) ~= "string" and type(book_id) ~= "number" then return nil end
     local s = tostring(book_id)
-    return s:match("^komga://book/(.+)$") or s
+    local stripped = s:match("^komga://book/(.+)$") or s
+    if stripped == "" or #stripped > 128 or not stripped:match("^[%w%-_]+$") then
+        return nil
+    end
+    return stripped
 end
 
 M.normalizeBookId = normalizeBookId
@@ -78,8 +107,10 @@ function M.enqueue(action_type, book_id, data)
             title = data.title or (existing and existing.title),
         }
     else
-        local new_page = tonumber(data.page) or (existing and existing.page) or 1
-        local new_total = tonumber(data.total_pages) or (existing and existing.total_pages)
+        local raw_page = tonumber(data.page)
+        local new_page = (isFiniteNumber(raw_page) and raw_page) or (existing and existing.page) or 1
+        local raw_total = tonumber(data.total_pages)
+        local new_total = (isFiniteNumber(raw_total) and raw_total) or (existing and existing.total_pages)
         local new_completed = (data.completed == true) or (existing and existing.completed == true) or false
         if new_total and new_total > 0 and new_page >= new_total then
             new_completed = true
@@ -101,7 +132,10 @@ function M.enqueue(action_type, book_id, data)
     end
 
     s:saveSetting("queue", q)
-    s:flush()
+    local ok_fl, fl_err = s:flush()
+    if ok_fl == false then
+        logger.warn("[Bridge SyncQueue] enqueue flush failed: " .. tostring(fl_err))
+    end
 
     local entry = q[id]
     logger.info(string.format("[Bridge SyncQueue] Enqueued offline action '%s' for book %s (page=%s, completed=%s)",
@@ -136,6 +170,35 @@ function M.removeMultiple(book_ids, defer_flush)
         return true
     end
     return false
+end
+
+function M.removeIfUnchanged(book_id, expected_item, defer_flush)
+    local id = normalizeBookId(book_id)
+    if not id or type(expected_item) ~= "table" then return false end
+    local s = getSettings()
+    if not s then return false end
+
+    local q = s:readSetting("queue") or {}
+    local cur = q[id]
+    if type(cur) ~= "table" then return false end
+    if cur.action ~= expected_item.action
+            or cur.timestamp ~= expected_item.timestamp
+            or cur.page ~= expected_item.page
+            or (cur.completed == true) ~= (expected_item.completed == true) then
+        logger.info("[Bridge SyncQueue] Preserving newer mid-flush queue entry for book " .. tostring(id))
+        return false
+    end
+
+    q[id] = nil
+    s:saveSetting("queue", q)
+    if not defer_flush then
+        local ok_fl, fl_err = s:flush()
+        if ok_fl == false then
+            logger.warn("[Bridge SyncQueue] removeIfUnchanged flush failed: " .. tostring(fl_err))
+        end
+    end
+    logger.info("[Bridge SyncQueue] Removed book " .. tostring(id) .. " from queue")
+    return true
 end
 
 function M.remove(book_id, defer_flush)
@@ -204,10 +267,10 @@ function M.isServerFurther(server_book, queued_item)
 
     -- 1. Unread action in queue ("delete")
     if queued_item.action == "delete" then
-        if s_completed or s_page > 0 then
-            return true, "server has progress while queue is delete/unread"
+        if not s_completed and s_page == 0 then
+            return true, "server already unread"
         end
-        return true, "server already unread"
+        return false, "server still has progress; must send DELETE"
     end
 
     -- 2. Book completion comparison
@@ -288,8 +351,17 @@ local function buildApiRequestOpts(api, path, method, body_table)
     if body_table ~= nil then
         local ok_j, json = pcall(require, "json")
         if ok_j and json and json.encode then
-            body_str = json.encode(body_table)
-            headers["Content-Type"] = "application/json"
+            local ok_enc, encoded = pcall(json.encode, body_table)
+            if ok_enc and type(encoded) == "string" then
+                body_str = encoded
+                headers["Content-Type"] = "application/json"
+            else
+                logger.warn("[Bridge SyncQueue] json.encode failed: " .. tostring(encoded))
+                return nil
+            end
+        else
+            logger.warn("[Bridge SyncQueue] json module unavailable for request body")
+            return nil
         end
     end
 
@@ -400,7 +472,9 @@ function M.flush(api, on_complete)
 
     M._flushing = true
     M._flushing_started_at = os.time()
-    logger.info(string.format("[Bridge SyncQueue] Starting cooperative flush for %d pending items", count))
+    M._flush_gen = (M._flush_gen or 0) + 1
+    local my_gen = M._flush_gen
+    logger.info(string.format("[Bridge SyncQueue] Starting cooperative flush for %d pending items (gen=%d)", count, my_gen))
 
     local actions_list = {}
     for _, item in pairs(q) do
@@ -411,17 +485,27 @@ function M.flush(api, on_complete)
     local pruned_cnt = 0
     local unreachable_encountered = false
     local failure_reason = nil
+    local finished = false
 
     local ok_ui, UIManager = pcall(require, "ui/uimanager")
     local has_ui = (ok_ui and UIManager and UIManager.scheduleIn)
     local ok_ah, AsyncHttp = pcall(require, "lib/bridge_async_http")
     local use_async_http = has_ui and ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable()
 
+    local function isStaleGen()
+        return M._flush_gen ~= my_gen
+    end
+
     local function finish_flush()
+        if finished or isStaleGen() then return end
+        finished = true
         if pushed_cnt > 0 or pruned_cnt > 0 then
             local s = getSettings()
             if s and s.flush then
-                pcall(function() s:flush() end)
+                local ok_fl, fl_err = pcall(function() return s:flush() end)
+                if not ok_fl or fl_err == false then
+                    logger.warn("[Bridge SyncQueue] finish_flush disk flush failed: " .. tostring(fl_err))
+                end
             end
         end
         M._flush_settings = nil
@@ -451,13 +535,14 @@ function M.flush(api, on_complete)
     end
 
     local function step(idx)
+        if isStaleGen() then return end
         if unreachable_encountered or idx > #actions_list then
             finish_flush()
             return
         end
 
         local item = actions_list[idx]
-        local book_id = item and item.book_id
+        local book_id = item and normalizeBookId(item.book_id)
         if not book_id then
             if has_ui then
                 UIManager:scheduleIn(0.05, function() step(idx + 1) end)
@@ -468,6 +553,7 @@ function M.flush(api, on_complete)
         end
 
         local function scheduleNext()
+            if isStaleGen() then return end
             if has_ui then
                 UIManager:scheduleIn(0.05, function() step(idx + 1) end)
             else
@@ -475,9 +561,10 @@ function M.flush(api, on_complete)
             end
         end
 
-        local function handlePushResult(success, err, is_unreachable)
+        local function handlePushResult(success, err, is_unreachable, http_code)
+            if isStaleGen() then return end
             if success then
-                M.remove(book_id, true)
+                M.removeIfUnchanged(book_id, item, true)
                 pushed_cnt = pushed_cnt + 1
                 logger.info(string.format("[Bridge SyncQueue] Flushed book %s (page=%s, completed=%s)",
                     tostring(book_id),
@@ -486,20 +573,19 @@ function M.flush(api, on_complete)
                 ))
                 scheduleNext()
             else
-                local err_str = tostring(err):lower()
-                if is_unreachable or err_str:find("timeout") or err_str:find("unreachable") or err_str:find("refused") then
-                    logger.warn("[Bridge SyncQueue] Flush interrupted by unreachable server:", tostring(err))
+                if isPermanentClientError(http_code) or (http_code == nil and not isTransientOrUnreachable(err, is_unreachable, http_code)) then
+                    logger.warn(string.format("[Bridge SyncQueue] Dropping book %s from queue after permanent client error: %s", tostring(book_id), tostring(err)))
+                    M.removeIfUnchanged(book_id, item, true)
+                    pruned_cnt = pruned_cnt + 1
+                    scheduleNext()
+                else
+                    logger.warn("[Bridge SyncQueue] Flush interrupted by transient/unreachable error:", tostring(err))
                     if ok_h and Health and Health.tripCircuitBreaker then
                         Health.tripCircuitBreaker(err)
                     end
                     unreachable_encountered = true
                     failure_reason = tostring(err)
                     finish_flush()
-                else
-                    logger.warn(string.format("[Bridge SyncQueue] Dropping book %s from queue after client error: %s", tostring(book_id), tostring(err)))
-                    M.remove(book_id, true)
-                    pruned_cnt = pruned_cnt + 1
-                    scheduleNext()
                 end
             end
         end
@@ -517,8 +603,15 @@ function M.flush(api, on_complete)
                 end
                 if req_opts then
                     AsyncHttp.requestAsync(req_opts, function(ok, code, _, err_msg)
-                        local is_unreach = (tonumber(code) or 0) == 0
-                        handlePushResult(ok, err_msg, is_unreach)
+                        local ok_cb, cb_err = pcall(function()
+                            local num_code = tonumber(code) or 0
+                            local is_unreach = (num_code == 0)
+                            handlePushResult(ok, err_msg, is_unreach, num_code)
+                        end)
+                        if not ok_cb then
+                            logger.warn("[Bridge SyncQueue] Async push callback error: " .. tostring(cb_err))
+                            scheduleNext()
+                        end
                     end)
                     return
                 end
@@ -530,10 +623,11 @@ function M.flush(api, on_complete)
             else
                 success, err, is_unreachable = api:patch_read_progress(book_id, item.page, item.completed, { timeout = 3, total_timeout = 5 })
             end
-            handlePushResult(success, err, is_unreachable)
+            handlePushResult(success, err, is_unreachable, nil)
         end
 
         local function handleServerBook(server_book, s_err, s_unreachable)
+            if isStaleGen() then return end
             if s_unreachable then
                 logger.warn("[Bridge SyncQueue] Flush interrupted by unreachable server during book check:", tostring(s_err))
                 if ok_h and Health and Health.tripCircuitBreaker then
@@ -553,7 +647,7 @@ function M.flush(api, on_complete)
             if server_further then
                 logger.info(string.format("[Bridge SyncQueue] Server progress is further for book %s (%s). Dropping stale queued update.",
                     tostring(book_id), tostring(reason)))
-                M.remove(book_id, true)
+                M.removeIfUnchanged(book_id, item, true)
                 pruned_cnt = pruned_cnt + 1
                 scheduleNext()
             else
@@ -571,19 +665,31 @@ function M.flush(api, on_complete)
             local get_opts = buildApiRequestOpts(api, "/api/v1/books/" .. tostring(book_id), "GET", nil)
             if get_opts then
                 AsyncHttp.requestAsync(get_opts, function(ok, code, resp_body, err_msg)
-                    local num_code = tonumber(code) or 0
-                    if not ok then
-                        local is_unreach = (num_code == 0)
-                        handleServerBook(nil, err_msg, is_unreach)
-                        return
+                    local ok_cb, cb_err = pcall(function()
+                        local num_code = tonumber(code) or 0
+                        if not ok then
+                            local is_unreach = isTransientOrUnreachable(err_msg, num_code == 0, num_code)
+                            handleServerBook(nil, err_msg, is_unreach)
+                            return
+                        end
+                        local ok_j, json = pcall(require, "json")
+                        local decoded = nil
+                        if ok_j and json and json.decode and resp_body and resp_body ~= "" then
+                            local ok_d, tbl = pcall(json.decode, resp_body)
+                            if ok_d and type(tbl) == "table" then
+                                decoded = tbl
+                            else
+                                logger.warn("[Bridge SyncQueue] Malformed JSON on GET book " .. tostring(book_id) .. "; retaining item")
+                                handleServerBook(nil, "Malformed JSON response", true)
+                                return
+                            end
+                        end
+                        handleServerBook(decoded, nil, false)
+                    end)
+                    if not ok_cb then
+                        logger.warn("[Bridge SyncQueue] Async GET callback error: " .. tostring(cb_err))
+                        scheduleNext()
                     end
-                    local ok_j, json = pcall(require, "json")
-                    local decoded = nil
-                    if ok_j and json and json.decode and resp_body and resp_body ~= "" then
-                        local ok_d, tbl = pcall(json.decode, resp_body)
-                        if ok_d and type(tbl) == "table" then decoded = tbl end
-                    end
-                    handleServerBook(decoded, nil, false)
                 end)
                 return
             end

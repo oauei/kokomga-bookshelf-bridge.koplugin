@@ -17,6 +17,22 @@ local function getKomgaPlugin()
     return loaded and loaded["kokomga"] or nil
 end
 
+local function replaceLiteral(str, find_str, repl_str)
+    if type(str) ~= "string" or type(find_str) ~= "string" or find_str == "" then return str, false end
+    local s, e = str:find(find_str, 1, true)
+    if not s then return str, false end
+    return str:sub(1, s - 1) .. repl_str .. str:sub(e + 1), true
+end
+
+local function extractOrigin(url)
+    if type(url) ~= "string" then return nil end
+    local scheme, hostport = url:match("^([%a][%w+.-]*)://([^/?#]+)")
+    if not (scheme and hostport) then return nil end
+    scheme = scheme:lower()
+    if scheme ~= "http" and scheme ~= "https" then return nil end
+    return scheme .. "://" .. hostport:lower()
+end
+
 function M.normalizeBaseUrl(url)
     if type(url) ~= "string" then return "" end
     local ok_u, util = pcall(require, "util")
@@ -25,11 +41,15 @@ function M.normalizeBaseUrl(url)
     else
         url = url:gsub("^%s+", ""):gsub("%s+$", "")
     end
-    if url == "" then return "" end
-    if not url:match("^%a+://") then
+    if url == "" or url:find("[%z\r\n]") then return "" end
+    if url:match("^([%a][%w+.-]*)://") then
+        local scheme = url:match("^([%a][%w+.-]*)://"):lower()
+        if scheme ~= "http" and scheme ~= "https" then return "" end
+    else
         url = "http://" .. url
     end
     url = url:gsub("/+$", "")
+    if not extractOrigin(url) then return "" end
     return url
 end
 
@@ -183,43 +203,25 @@ function M.switchServerAddress(new_base_url, profile_name)
         if komga.initAPI then komga:initAPI() end
     end
 
-    -- 2. Update OPDS catalog in Bookshelf
+    -- 2. Update OPDS catalog in Bookshelf (match strictly by old origin/URL; never steal unrelated OPDS creds)
     local ok_c, Catalogs = pcall(require, "lib/bookshelf_opds_catalogs")
     if ok_c and Catalogs and Catalogs.list then
         local cat_list = Catalogs.list() or {}
         local found = false
-        local fallback_user, fallback_pass
+        local old_origin = extractOrigin(old_base_url)
         for _, s in ipairs(cat_list) do
-            if s.username or s.password then
-                fallback_user = fallback_user or s.username
-                fallback_pass = fallback_pass or s.password
-            end
+            local s_origin = extractOrigin(s and s.url)
             if (old_opds_url ~= "" and s.url == old_opds_url)
-                or (old_base_url ~= "" and s.url and s.url:find(old_base_url, 1, true))
-                or (s.url and s.url:find("/opds/v1.2/catalog", 1, true)) then
+                or (old_origin and s_origin and s_origin == old_origin) then
                 s.url = new_opds_url
                 found = true
                 break
             end
         end
         if not found and #cat_list > 0 then
-            local matched = M.findServers()
-            if matched and #matched > 0 then
-                for _, s in ipairs(cat_list) do
-                    if s.url == matched[1].url then
-                        s.url = new_opds_url
-                        found = true
-                        break
-                    end
-                end
-            end
-        end
-        if not found and #cat_list > 0 then
             cat_list[#cat_list + 1] = {
                 title = "Komga",
                 url = new_opds_url,
-                username = fallback_user,
-                password = fallback_pass,
             }
         end
         if Catalogs.persist then
@@ -227,7 +229,7 @@ function M.switchServerAddress(new_base_url, profile_name)
         end
     end
 
-    -- 3. Update tabs in Bookshelf TabModel
+    -- 3. Update tabs in Bookshelf TabModel (literal string replacement, never Lua pattern gsub)
     local ok_tm, TabModel = pcall(require, "lib/bookshelf_tab_model")
     if ok_tm and TabModel and TabModel.load then
         local tabs = TabModel.load() or {}
@@ -237,14 +239,14 @@ function M.switchServerAddress(new_base_url, profile_name)
                 if old_server_key and t.source.id == old_server_key then
                     t.source.id = new_server_key
                     changed = true
-                elseif not t.source.id or t.source.id == "" then
-                    t.source.id = new_server_key
-                    changed = true
                 end
 
-                if old_base_url ~= "" and type(t.source.feed_url) == "string" and t.source.feed_url:find(old_base_url, 1, true) then
-                    t.source.feed_url = t.source.feed_url:gsub(old_base_url, new_base_url)
-                    changed = true
+                if old_base_url ~= "" and type(t.source.feed_url) == "string" then
+                    local replaced, did_rep = replaceLiteral(t.source.feed_url, old_base_url, new_base_url)
+                    if did_rep then
+                        t.source.feed_url = replaced
+                        changed = true
+                    end
                 end
 
                 if type(t.source.opds) == "table" then
@@ -254,9 +256,12 @@ function M.switchServerAddress(new_base_url, profile_name)
                                 s.id = new_server_key
                                 changed = true
                             end
-                            if old_base_url ~= "" and type(s.feed_url) == "string" and s.feed_url:find(old_base_url, 1, true) then
-                                s.feed_url = s.feed_url:gsub(old_base_url, new_base_url)
-                                changed = true
+                            if old_base_url ~= "" and type(s.feed_url) == "string" then
+                                local replaced, did_rep = replaceLiteral(s.feed_url, old_base_url, new_base_url)
+                                if did_rep then
+                                    s.feed_url = replaced
+                                    changed = true
+                                end
                             end
                         end
                     end
@@ -268,12 +273,21 @@ function M.switchServerAddress(new_base_url, profile_name)
         end
     end
 
-    -- 4. Mark active profile in profiles list
+    -- 4. Mark active profile in profiles list and invalidate bridge caches
     local profiles = M.getProfiles()
     for _, p in ipairs(profiles) do
         p.active = (p.base_url == new_base_url)
     end
     M.saveProfiles(profiles)
+
+    local ok_ba, BridgeAuth = pcall(require, "lib/bridge_auth")
+    if ok_ba and BridgeAuth and BridgeAuth.invalidateOrigins then
+        pcall(BridgeAuth.invalidateOrigins)
+    end
+    local ok_bc, BridgeCache = pcall(require, "lib/bridge_cache")
+    if ok_bc and BridgeCache and BridgeCache.clearAliasedCoverCache then
+        pcall(BridgeCache.clearAliasedCoverCache)
+    end
 
     local ok_h, Health = pcall(require, "lib/bridge_health")
     if ok_h and Health and Health.resetCircuitBreaker then
@@ -563,16 +577,24 @@ function M.showNetworkProfilesDialog(on_complete)
                 callback = function()
                     UIManager:close(dialog)
                     UIManager:nextTick(function()
-                        local ok_sw, sw_err = pcall(function()
-                            M.switchServerAddress(target_url, target_name)
-                        end)
+                        local ok_sw, switched = pcall(M.switchServerAddress, target_url, target_name)
                         if not ok_sw then
-                            logger.error("[Bridge Profiles] Error switching server address:", tostring(sw_err))
+                            logger.error("[Bridge Profiles] Error switching server address:", tostring(switched))
+                            UIManager:show(Notification:new{
+                                text = _("Failed to switch Komga server"),
+                                timeout = 3,
+                            })
+                        elseif switched then
+                            UIManager:show(Notification:new{
+                                text = _("Switched Komga server to: ") .. tostring(target_name or ""),
+                                timeout = 3,
+                            })
+                        else
+                            UIManager:show(Notification:new{
+                                text = _("Invalid Komga server URL"),
+                                timeout = 3,
+                            })
                         end
-                        UIManager:show(Notification:new{
-                            text = _("Switched Komga server to: ") .. target_name,
-                            timeout = 3,
-                        })
                         if on_complete then
                             pcall(on_complete)
                         end

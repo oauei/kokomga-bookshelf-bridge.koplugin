@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main, brownfield]
+  pull_request:
+    branches: [main, brownfield]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LuaJIT and Luacheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luajit luarocks
+          sudo luarocks install luacheck
+
+      - name: Run Luacheck
+        run: luacheck --no-color .
+
+      - name: Syntax check all Lua files with LuaJIT
+        run: |
+          for f in *.lua lib/*.lua; do
+            luajit -bl "$f" > /dev/null
+          done
