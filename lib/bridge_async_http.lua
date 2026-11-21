@@ -152,7 +152,7 @@ function M.requestAsync(opts, callback)
 
     local cfg_lines = {
         "url = " .. escapeCfgValue(opts.url),
-        "request = " .. escapeCfgValue(method),
+        method == "HEAD" and "head" or ("request = " .. escapeCfgValue(method)),
         "connect-timeout = " .. tostring(connect_timeout),
         "max-time = " .. tostring(max_time),
         "proto = " .. escapeCfgValue("=http,https"),
@@ -199,7 +199,7 @@ function M.requestAsync(opts, callback)
         or ("rm -f " .. q_cfg)
 
     local inner_cmd = string.format(
-        '%s -K %s > %s 2>/dev/null & cpid=$!; echo $cpid > %s; wait $cpid; rc=$?; printf "\\n%%d\\n" "$rc" >> %s; %s; mv %s %s',
+        '%s -K %s > %s 2>/dev/null & cpid=$!; echo $cpid > %s; wait $cpid; rc=$?; printf "\\nCURL_RC=%%d\\n" "$rc" >> %s; %s; mv %s %s',
         q_curl, q_cfg, q_meta, q_pid, q_meta, bg_rm, q_meta, q_done
     )
     local cmd = "sh -c " .. shellQuote(inner_cmd) .. " >/dev/null 2>&1 &"
@@ -219,10 +219,9 @@ function M.requestAsync(opts, callback)
 
     local function poll()
         if fileExists(done_path) then
-            local meta_str = readFile(done_path) or "0\n1"
-            local code_str, rc_str = meta_str:match("^(%d+)%s+(%d+)")
-            local code = tonumber(code_str or meta_str:match("(%d+)")) or 0
-            local curl_rc = tonumber(rc_str) or 0
+            local meta_str = readFile(done_path) or "0\nCURL_RC=1"
+            local code = tonumber(meta_str:match("^(%d+)")) or 0
+            local curl_rc = tonumber(meta_str:match("CURL_RC=(%d+)")) or tonumber(meta_str:match("^%d+%s+(%d+)")) or 0
             local resp_body = nil
             if not opts.output_path then
                 resp_body = readFile(out_path)
