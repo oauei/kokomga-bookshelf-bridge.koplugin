@@ -21,11 +21,13 @@ end
 local _captured_komga = nil
 
 local function usable(plugin)
-    return plugin and (plugin.settings or plugin.api or plugin.sync) and plugin
+    return type(plugin) == "table" and (plugin.settings or plugin.api or plugin.sync) and plugin or nil
 end
 
 local function getUpvalueByName(fn, target_name)
-    if type(fn) ~= "function" then return nil end
+    if type(fn) ~= "function" or type(debug) ~= "table" or type(debug.getupvalue) ~= "function" then
+        return nil
+    end
     local i = 1
     while true do
         local name, val = debug.getupvalue(fn, i)
@@ -42,7 +44,11 @@ local function extractFromKomgaSpec()
     if not (komga_spec and komga_spec.fetch) then return nil end
     local liveFn = getUpvalueByName(komga_spec.fetch, "livePlugin")
     if type(liveFn) == "function" then
-        local p = getUpvalueByName(liveFn, "registered_plugin") or liveFn()
+        local p = getUpvalueByName(liveFn, "registered_plugin")
+        if not usable(p) then
+            local ok_l, res = pcall(liveFn)
+            if ok_l then p = res end
+        end
         if usable(p) then return p end
     end
     return nil
@@ -53,11 +59,12 @@ local function hookBookshelfInstance(bs)
         bs._bridge_source_changed_hooked = true
         local orig_sc = bs.sourceChanged
         if type(orig_sc) == "function" then
-            bs.sourceChanged = function(self_bs, id)
-                orig_sc(self_bs, id)
-                if id == "komga" then
-                    pcall(orig_sc, self_bs, "hybrid")
+            bs.sourceChanged = function(self_bs, id, ...)
+                local res = orig_sc(self_bs, id, ...)
+                if id == "komga" or id == "opds" then
+                    pcall(orig_sc, self_bs, "hybrid", ...)
                 end
+                return res
             end
         end
     end
@@ -85,28 +92,30 @@ local function hookSourcesChanged()
     if ok_s and Sources and type(Sources.changed) == "function" and not Sources._bridge_changed_hooked then
         Sources._bridge_changed_hooked = true
         local orig_changed = Sources.changed
-        Sources.changed = function(id)
-            orig_changed(id)
+        Sources.changed = function(id, ...)
+            local res = orig_changed(id, ...)
             if id == "komga" or id == "opds" then
-                pcall(orig_changed, "hybrid")
+                pcall(orig_changed, "hybrid", ...)
             end
+            return res
         end
     end
 end
 
 local function getKomgaPlugin()
-    if usable(_captured_komga) then return _captured_komga end
+    local live = liveModule("kokomga")
+    if usable(live) then
+        _captured_komga = live
+        return live
+    end
+
     local ext = extractFromKomgaSpec()
     if usable(ext) then
         _captured_komga = ext
         return ext
     end
 
-    local live = liveModule("kokomga")
-    if usable(live) then
-        _captured_komga = live
-        return live
-    end
+    if usable(_captured_komga) then return _captured_komga end
 
     local ok_p, PluginLoader = pcall(require, "pluginloader")
     local loaded = ok_p and PluginLoader and PluginLoader.loaded_plugins or nil
@@ -123,7 +132,7 @@ local function getKomgaPlugin()
         end
     end
 
-    return live or p or _captured_komga or nil
+    return (type(live) == "table" and live) or (type(p) == "table" and p) or (type(_captured_komga) == "table" and _captured_komga) or nil
 end
 
 M.getKomgaPlugin = getKomgaPlugin
@@ -202,10 +211,14 @@ function M.patchKokomgaMenu(profiles_mod)
         local found = false
         for sec_idx, section in ipairs(menu) do
             if section.text == "Server Setup" or section.text == _("Server Setup") or (section.text and section.text:find("Setup")) then
-                if section.sub_item_table_func then
+                if section.sub_item_table_func and not section._bridge_setup_patched then
+                    section._bridge_setup_patched = true
                     local orig_sub = section.sub_item_table_func
                     section.sub_item_table_func = function()
                         local ok_s, sub_items = pcall(orig_sub)
+                        if not ok_s then
+                            logger.warn("[Bridge] Server Setup orig_sub failed:", tostring(sub_items))
+                        end
                         sub_items = (ok_s and type(sub_items) == "table") and sub_items or {}
                         table.insert(sub_items, 1, {
                             text = _("Switch Server / Network Profiles…"),
@@ -229,7 +242,7 @@ function M.patchKokomgaMenu(profiles_mod)
                             callback = function(touchmenu_instance)
                                 local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
                                 if ok_sq and SyncQueue then
-                                    local count = SyncQueue.count()
+                                    local count = SyncQueue.count and SyncQueue.count() or 0
                                     if count == 0 then
                                         UIManager:show(Notification:new{ text = _("Offline sync queue is empty.") })
                                         return
@@ -244,7 +257,8 @@ function M.patchKokomgaMenu(profiles_mod)
                                         return
                                     end
                                     UIManager:show(Notification:new{ text = string.format(_("Syncing %d pending action(s)..."), count) })
-                                    SyncQueue.flush(self_m.plugin and self_m.plugin.api, function(success, res)
+                                    local api = (self_m and self_m.plugin and self_m.plugin.api) or (getKomgaPlugin() and getKomgaPlugin().api)
+                                    SyncQueue.flush(api, function(success, res)
                                         if success then
                                             if type(res) == "table" then
                                                 local pushed = res.pushed or 0
@@ -261,7 +275,7 @@ function M.patchKokomgaMenu(profiles_mod)
                                             UIManager:show(Notification:new{ text = string.format(_("Sync paused: %s"), tostring(res)) })
                                         end
                                         if touchmenu_instance and touchmenu_instance.updateItems then
-                                            touchmenu_instance:updateItems()
+                                            pcall(touchmenu_instance.updateItems, touchmenu_instance)
                                         end
                                     end)
                                 end
@@ -272,10 +286,14 @@ function M.patchKokomgaMenu(profiles_mod)
                     found = true
                 end
             elseif section.text == "Options" or section.text == _("Options") or (section.text and section.text:find("Option")) then
-                if section.sub_item_table_func then
+                if section.sub_item_table_func and not section._bridge_options_patched then
+                    section._bridge_options_patched = true
                     local orig_sub_opt = section.sub_item_table_func
                     section.sub_item_table_func = function()
                         local ok_s, sub_items = pcall(orig_sub_opt)
+                        if not ok_s then
+                            logger.warn("[Bridge] Options orig_sub_opt failed:", tostring(sub_items))
+                        end
                         sub_items = (ok_s and type(sub_items) == "table") and sub_items or {}
 
                         local rtl_idx = nil
@@ -300,12 +318,13 @@ function M.patchKokomgaMenu(profiles_mod)
                                     G_reader_settings:saveSetting("bridge_auto_rtl_advanced", new_val)
                                     pcall(function() G_reader_settings:flush() end)
                                 end
-                                if new_val and self_m.plugin and self_m.plugin.settings and self_m.plugin.settings.auto_rtl_direction then
-                                    self_m.plugin.settings.auto_rtl_direction = false
-                                    pcall(function() self_m.plugin:saveSettings() end)
+                                local plug = (self_m and self_m.plugin) or getKomgaPlugin()
+                                if new_val and plug and plug.settings and plug.settings.auto_rtl_direction then
+                                    plug.settings.auto_rtl_direction = false
+                                    pcall(function() plug:saveSettings() end)
                                 end
                                 if touchmenu_instance and touchmenu_instance.updateItems then
-                                    touchmenu_instance:updateItems()
+                                    pcall(touchmenu_instance.updateItems, touchmenu_instance)
                                 end
                             end,
                         }
@@ -410,12 +429,17 @@ function M.enhanceKomgaShelfSource(profiles_mod)
 
     local orig_pick = komga_spec.pick
     komga_spec.pick = function(draft, done)
+        draft = type(draft) == "table" and draft or {}
+        draft.source = type(draft.source) == "table" and draft.source or {}
         local komga = getKomgaPlugin()
         local libraries = nil
-        if komga and komga.api then
+        local reachable = (not Health or not Health.isServerReachable or Health.isServerReachable())
+        if reachable and komga and komga.api and type(komga.api.get_libraries) == "function" then
             local ok_l, res = pcall(komga.api.get_libraries, komga.api)
             if ok_l and type(res) == "table" then
                 libraries = res
+            elseif not ok_l then
+                logger.warn("[Bridge] komga.api.get_libraries failed:", tostring(res))
             end
         end
 
@@ -440,20 +464,22 @@ function M.enhanceKomgaShelfSource(profiles_mod)
         }
 
         for _, lib in ipairs(libraries) do
-            local l = lib
-            buttons[#buttons + 1] = {
-                {
-                    text = l.name or l.id,
-                    callback = function()
-                        if d then UIManager:close(d); d = nil end
-                        draft.source.list = "all_series"
-                        draft.source.library_id = { l.id }
-                        draft.source.library_names = { [l.id] = l.name }
-                        draft.label = l.name
-                        done()
-                    end,
-                },
-            }
+            if type(lib) == "table" and lib.id ~= nil then
+                local l = lib
+                buttons[#buttons + 1] = {
+                    {
+                        text = l.name or tostring(l.id),
+                        callback = function()
+                            if d then UIManager:close(d); d = nil end
+                            draft.source.list = "all_series"
+                            draft.source.library_id = { l.id }
+                            draft.source.library_names = { [l.id] = l.name or tostring(l.id) }
+                            draft.label = l.name or tostring(l.id)
+                            done()
+                        end,
+                    },
+                }
+            end
         end
 
         buttons[#buttons + 1] = {
@@ -532,12 +558,11 @@ local function patchApiTable(target)
         -- Komga server defaults to metadata.numberSort,asc for series books.
         -- When { sort = "metadata.numberSort,asc" } is passed, escape_uri escapes ',' as '%2C',
         -- which breaks Spring Boot's SortHandlerMethodArgumentResolver (yielding HTTP 500/400).
-        if filters and filters.sort then
+        if type(filters) == "table" and filters.sort then
             local clean = {}
             for k, v in pairs(filters) do clean[k] = v end
             clean.sort = nil
-            local ok_res, res = pcall(orig_get_books, self, series_id, clean, page, size)
-            if ok_res and res then return res end
+            return orig_get_books(self, series_id, clean, page, size)
         end
         return orig_get_books(self, series_id, filters, page, size)
     end
@@ -718,34 +743,51 @@ local function isMangaDocument(document, filepath)
 end
 
 local function copy_file(src, dst)
-    if not src or not dst or src == "" or dst == "" then return false end
+    if type(src) ~= "string" or type(dst) ~= "string" or src == "" or dst == "" then return false end
     local ok_u, util = pcall(require, "util")
     if ok_u and util and util.makePath then
         local dest_dir = dst:match("^(.*)/[^/]+$")
-        if dest_dir then util.makePath(dest_dir .. "/") end
+        if dest_dir then pcall(util.makePath, dest_dir .. "/") end
     end
 
     local ok_fu, ffiutil = pcall(require, "ffi/util")
     if ok_fu and ffiutil and ffiutil.copyFile then
         local ok, res = pcall(ffiutil.copyFile, src, dst)
-        if ok and res then return true end
+        if ok and res == true then return true end
     end
 
     local rf = io.open(src, "rb")
     if not rf then return false end
-    local wf = io.open(dst, "wb")
+    local tmp = dst .. ".tmp"
+    local wf = io.open(tmp, "wb")
     if not wf then
         rf:close()
         return false
     end
+    local write_ok = true
     while true do
         local chunk = rf:read(65536)
         if not chunk then break end
-        wf:write(chunk)
+        local ok_w = wf:write(chunk)
+        if not ok_w then
+            write_ok = false
+            break
+        end
     end
-    wf:flush()
     rf:close()
-    wf:close()
+    if write_ok then
+        write_ok = (wf:flush() ~= nil)
+    end
+    local close_ok = wf:close()
+    if not write_ok or not close_ok then
+        pcall(os.remove, tmp)
+        return false
+    end
+    local ren_ok = os.rename(tmp, dst)
+    if not ren_ok then
+        pcall(os.remove, tmp)
+        return false
+    end
     return true
 end
 
@@ -768,9 +810,13 @@ local function getDirectoryCover(filepath)
     local candidates = { ".cover.jpg", ".cover.png", ".cover.webp", ".cover", "cover.jpg", "cover.png", "folder.jpg" }
     for _, name in ipairs(candidates) do
         local p = dir .. "/" .. name
-        if ok_lfs and lfs and lfs.attributes(p, "mode") == "file" then
-            _dir_cover_cache[dir] = p
-            return p
+        if ok_lfs and lfs then
+            local attr_fn = lfs.symlinkattributes or lfs.attributes
+            local ok_a, mode = pcall(attr_fn, p, "mode")
+            if ok_a and mode == "file" then
+                _dir_cover_cache[dir] = p
+                return p
+            end
         else
             local f = io.open(p, "rb")
             if f then
@@ -844,13 +890,41 @@ function M.handleAutoRtlAdvanced(ui)
     return order_changed
 end
 
+local _suspend_in_progress = false
+local _suspend_started_at = 0
+local MAX_SUSPEND_TTL = 30
+local _resume_cooldown_until = 0
+
+local function isLifecycleCooldown()
+    if _suspend_in_progress then
+        if _suspend_started_at > 0 and (os.time() - _suspend_started_at) > MAX_SUSPEND_TTL then
+            _suspend_in_progress = false
+        else
+            return true
+        end
+    end
+    return os.time() < _resume_cooldown_until
+end
+
+local function isNetworkOffline()
+    local ok_nm, NetworkMgr = pcall(require, "ui/network/manager")
+    if ok_nm and NetworkMgr then
+        if NetworkMgr.isConnected then
+            return not NetworkMgr:isConnected()
+        elseif NetworkMgr.isOnline then
+            return not NetworkMgr:isOnline()
+        end
+    end
+    return false
+end
+
 local function hookOnReaderReady(proto)
     if not proto or proto._bridge_rtl_hooked then return end
     if type(proto.onReaderReady) ~= "function" then return end
     proto._bridge_rtl_hooked = true
 
     local orig_onReaderReady = proto.onReaderReady
-    proto.onReaderReady = function(self_k)
+    proto.onReaderReady = function(self_k, ...)
         local document = self_k.ui and self_k.ui.document
         local filepath = document and document.file
         local is_manga = isMangaDocument(document, filepath)
@@ -863,7 +937,7 @@ local function hookOnReaderReady(proto)
             self_k.settings.auto_rtl_direction = false
         end
 
-        local ok, res = pcall(orig_onReaderReady, self_k)
+        local ok, res = pcall(orig_onReaderReady, self_k, ...)
 
         if saved_rtl ~= nil then
             self_k.settings.auto_rtl_direction = saved_rtl
@@ -874,10 +948,10 @@ local function hookOnReaderReady(proto)
         end
 
         local ok_h, Health = pcall(require, "lib/bridge_health")
-        if ok_h and Health and Health.isServerReachable and Health.isServerReachable() then
+        if not isLifecycleCooldown() and not isNetworkOffline() and ok_h and Health and Health.isServerReachable and Health.isServerReachable() then
             local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
             if ok_sq and SyncQueue and SyncQueue.hasPending and SyncQueue.hasPending() then
-                SyncQueue.flush(self_k.api)
+                pcall(SyncQueue.flush, self_k.api)
             end
         end
 
@@ -993,6 +1067,24 @@ M.hookScreensaverCover = hookScreensaverCover
 -- 6. Patch Kokomga Sync for ANR & Offline Protection
 -- ---------------------------------------------------------------------------
 
+local function validateKomgaId(id)
+    if type(id) == "number" then id = tostring(id) end
+    if type(id) == "string" and #id > 0 and #id <= 128 and id:match("^[%w%-_]+$") then
+        return id
+    end
+    return nil
+end
+
+local function safeDocPageCount(doc, fallback)
+    if doc and type(doc.getPageCount) == "function" then
+        local ok_c, cnt = pcall(doc.getPageCount, doc)
+        if ok_c and type(cnt) == "number" and cnt > 0 then
+            return cnt
+        end
+    end
+    return fallback
+end
+
 local function patchSyncTarget(sync_target)
     if not (sync_target and type(sync_target) == "table") then return end
     if sync_target._bridge_anr_patched then return end
@@ -1009,7 +1101,8 @@ local function patchSyncTarget(sync_target)
 
             -- 1. Always mark summary as complete in document settings and BookList cache
             if ui and ui.doc_settings then
-                local summary = ui.doc_settings:readSetting("summary") or {}
+                local summary = ui.doc_settings:readSetting("summary")
+                if type(summary) ~= "table" then summary = {} end
                 summary.status = "complete"
                 summary.modified = os.date("%Y-%m-%d", os.time())
                 ui.doc_settings:saveSetting("summary", summary)
@@ -1029,9 +1122,8 @@ local function patchSyncTarget(sync_target)
             local book_id = filepath and self_s.getOrMatchBook and self_s:getOrMatchBook(filepath)
             if book_id then
                 local current_page = ui.view and ui.view.state and ui.view.state.page or 1
-                local total_pages = ui.view and ui.view.state and ui.view.state.page_count
-                    or (ui.document and ui.document.getPageCount and ui.document:getPageCount())
-                    or current_page
+                local total_pages = (ui.view and ui.view.state and ui.view.state.page_count)
+                    or safeDocPageCount(ui.document, current_page)
                 local SyncQueue = require("lib/bridge_sync_queue")
                 SyncQueue.enqueue("progress", book_id, {
                     page = total_pages,
@@ -1153,25 +1245,6 @@ local function patchSyncTarget(sync_target)
         end
     end
 
-local _suspend_in_progress = false
-local _resume_cooldown_until = 0
-
-local function isLifecycleCooldown()
-    return _suspend_in_progress or os.time() < _resume_cooldown_until
-end
-
-local function isNetworkOffline()
-    local ok_nm, NetworkMgr = pcall(require, "ui/network/manager")
-    if ok_nm and NetworkMgr then
-        if NetworkMgr.isConnected then
-            return not NetworkMgr:isConnected()
-        elseif NetworkMgr.isOnline then
-            return not NetworkMgr:isOnline()
-        end
-    end
-    return false
-end
-
 local function enqueueDocumentProgress(self_s, ui, SyncQueue, reason_label)
     if not (ui and ui.document) then return false end
     local filepath = ui.document.file
@@ -1179,9 +1252,8 @@ local function enqueueDocumentProgress(self_s, ui, SyncQueue, reason_label)
     if not book_id then return false end
 
     local current_page = ui.view and ui.view.state and ui.view.state.page or 1
-    local total_pages = ui.view and ui.view.state and ui.view.state.page_count
-        or (ui.document and ui.document.getPageCount and ui.document:getPageCount())
-        or current_page
+    local total_pages = (ui.view and ui.view.state and ui.view.state.page_count)
+        or safeDocPageCount(ui.document, current_page)
     local is_completed = (total_pages and total_pages > 0 and current_page >= total_pages)
     if ui.doc_settings then
         local summary = ui.doc_settings:readSetting("summary")
@@ -1204,15 +1276,16 @@ local function enqueueDocumentProgress(self_s, ui, SyncQueue, reason_label)
     return true
 end
 
-local function dispatchAsyncProgressPush(self_s, book_id, current_page, total_pages, SyncQueue, orig_push, is_quiet)
-    local completed = (total_pages and total_pages > 0 and current_page >= total_pages) or false
+local function dispatchAsyncProgressPush(self_s, book_id, current_page, total_pages, SyncQueue, orig_push, is_quiet, force_completed, filepath)
+    local valid_id = validateKomgaId(book_id)
+    local completed = (force_completed == true) or (total_pages and total_pages > 0 and current_page >= total_pages) or false
     local ok_ah, AsyncHttp = pcall(require, "lib/bridge_async_http")
     local api = self_s and self_s.plugin and self_s.plugin.api
-    if ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable()
+    if valid_id and ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable()
             and SyncQueue.buildApiRequestOpts and api then
         local req_opts = SyncQueue.buildApiRequestOpts(
             api,
-            "/api/v1/books/" .. tostring(book_id) .. "/read-progress",
+            "/api/v1/books/" .. valid_id .. "/read-progress",
             "PATCH",
             { page = current_page, completed = completed }
         )
@@ -1224,13 +1297,17 @@ local function dispatchAsyncProgressPush(self_s, book_id, current_page, total_pa
                         SyncQueue.flush(api)
                     end
                 else
-                    SyncQueue.enqueue("progress", book_id, {
+                    if Health and Health.reportFailure then
+                        Health.reportFailure()
+                    end
+                    SyncQueue.enqueue("progress", valid_id, {
                         page = current_page,
                         total_pages = total_pages,
                         completed = completed,
+                        filepath = filepath,
                     })
                     logger.warn(string.format("[Bridge] Async pushProgress failed for %s (code=%s, err=%s); queued for retry",
-                        tostring(book_id), tostring(code), tostring(err_msg)))
+                        tostring(valid_id), tostring(code), tostring(err_msg)))
                 end
             end)
             if launched then
@@ -1238,7 +1315,11 @@ local function dispatchAsyncProgressPush(self_s, book_id, current_page, total_pa
             end
         end
     end
-    return orig_push(self_s, book_id, current_page, total_pages, is_quiet)
+    if not valid_id then
+        logger.warn("[Bridge] Rejected invalid book_id in dispatchAsyncProgressPush:", tostring(book_id))
+        return false
+    end
+    return orig_push(self_s, valid_id, current_page, total_pages, is_quiet)
 end
 
     -- 6. pushProgressForDocument
@@ -1260,8 +1341,13 @@ end
                 local p_net = self_s._pending_ensure_networking
                 self_s._pending_push_ui = nil
                 self_s._pending_ensure_networking = nil
-                logger.info("[Bridge] Explicit flush of debounced reading progress")
-                pcall(sync_target.pushProgressForDocument, self_s, p_ui, false, p_net)
+                if p_ui and p_ui.document then
+                    logger.info("[Bridge] Explicit flush of debounced reading progress")
+                    local ok_f, err_f = pcall(sync_target.pushProgressForDocument, self_s, p_ui, false, p_net)
+                    if not ok_f then
+                        logger.warn("[Bridge] flushDebouncedProgress failed:", tostring(err_f))
+                    end
+                end
             end
         end
 
@@ -1275,9 +1361,8 @@ end
             local is_finished = false
             if ui and ui.document then
                 local current_page = ui.view and ui.view.state and ui.view.state.page or 1
-                local total_pages = ui.view and ui.view.state and ui.view.state.page_count
-                    or (ui.document and ui.document.getPageCount and ui.document:getPageCount())
-                    or 0
+                local total_pages = (ui.view and ui.view.state and ui.view.state.page_count)
+                    or safeDocPageCount(ui.document, 0)
                 if total_pages > 0 and current_page >= total_pages then
                     is_finished = true
                 end
@@ -1291,6 +1376,11 @@ end
                         is_finished = true
                     end
                 end
+            end
+
+            -- Flush prior book's pending progress if switching documents before timer fires
+            if self_s._pending_push_ui and self_s._pending_push_ui ~= ui then
+                self_s:flushDebouncedProgress()
             end
 
             -- When reading normally (is_quiet == true), debounce progress push to avoid page turn latency.
@@ -1308,8 +1398,13 @@ end
                         local p_net = self_s._pending_ensure_networking
                         self_s._pending_push_ui = nil
                         self_s._pending_ensure_networking = nil
-                        logger.info("[Bridge] Executing debounced pushProgressForDocument after 5s idle pause")
-                        pcall(sync_target.pushProgressForDocument, self_s, p_ui, false, p_net)
+                        if p_ui and p_ui.document then
+                            logger.info("[Bridge] Executing debounced pushProgressForDocument after 5s idle pause")
+                            local ok_f, err_f = pcall(sync_target.pushProgressForDocument, self_s, p_ui, false, p_net)
+                            if not ok_f then
+                                logger.warn("[Bridge] Debounced pushProgressForDocument failed:", tostring(err_f))
+                            end
+                        end
                     end
                 end
 
@@ -1346,11 +1441,10 @@ end
             local book_id = filepath and self_s.getOrMatchBook and self_s:getOrMatchBook(filepath)
             if book_id then
                 local current_page = ui.view and ui.view.state and ui.view.state.page or 1
-                local total_pages = ui.view and ui.view.state and ui.view.state.page_count
-                    or (ui.document and ui.document.getPageCount and ui.document:getPageCount())
-                    or current_page
+                local total_pages = (ui.view and ui.view.state and ui.view.state.page_count)
+                    or safeDocPageCount(ui.document, current_page)
                 return dispatchAsyncProgressPush(self_s, book_id, current_page, total_pages, SyncQueue,
-                    function() return orig_push_doc(self_s, ui, is_quiet, ensure_networking) end, is_quiet)
+                    function() return orig_push_doc(self_s, ui, is_quiet, ensure_networking) end, is_quiet, is_finished, filepath)
             end
 
             return orig_push_doc(self_s, ui, is_quiet, ensure_networking)
@@ -1380,7 +1474,7 @@ end
                 return
             end
 
-            return dispatchAsyncProgressPush(self_s, book_id, current_page, total_pages, SyncQueue, orig_push, is_quiet)
+            return dispatchAsyncProgressPush(self_s, book_id, current_page, total_pages, SyncQueue, orig_push, is_quiet, false, nil)
         end
     end
 
@@ -1391,10 +1485,13 @@ end
             local pushes_before = {}
             if self_s.bg_processes then
                 for _, proc in ipairs(self_s.bg_processes) do
-                    if proc.is_push and proc.book_id then
+                    if type(proc) == "table" and proc.pid ~= nil and proc.is_push and proc.book_id then
                         pushes_before[proc.pid] = {
                             book_id = proc.book_id,
                             page = proc.page,
+                            total_pages = proc.total_pages,
+                            completed = proc.completed,
+                            filepath = proc.filepath,
                             start_time = proc.start_time,
                         }
                     end
@@ -1408,13 +1505,20 @@ end
                 local remaining_pids = {}
                 if self_s.bg_processes then
                     for _, proc in ipairs(self_s.bg_processes) do
-                        remaining_pids[proc.pid] = true
+                        if type(proc) == "table" and proc.pid ~= nil then
+                            remaining_pids[proc.pid] = true
+                        end
                     end
                 end
                 for pid, info in pairs(pushes_before) do
                     if not remaining_pids[pid] then
                         local SyncQueue = require("lib/bridge_sync_queue")
-                        SyncQueue.enqueue("progress", info.book_id, { page = info.page })
+                        SyncQueue.enqueue("progress", info.book_id, {
+                            page = info.page,
+                            total_pages = info.total_pages,
+                            completed = info.completed,
+                            filepath = info.filepath,
+                        })
                         logger.info(string.format("[Bridge] Enqueued failed push for book %s after circuit breaker trip", tostring(info.book_id)))
                     end
                 end
@@ -1431,22 +1535,29 @@ local function hookOnNetworkConnected(target)
     target._bridge_net_hooked = true
     local orig_net = target.onNetworkConnected
     target.onNetworkConnected = function(self_k, ...)
-        Health.resetCircuitBreaker()
+        pcall(Health.resetCircuitBreaker)
+        if _suspend_in_progress then
+            return
+        end
         local SyncQueue = require("lib/bridge_sync_queue")
-        local api = self_k.api or (self_k.getKomgaPlugin and self_k.getKomgaPlugin() and self_k.getKomgaPlugin().api)
+        local komga = getKomgaPlugin()
+        local api = (self_k and self_k.api) or (komga and komga.api)
         local function doFlush()
+            if isLifecycleCooldown() or isNetworkOffline() then return end
             if api then
-                SyncQueue.flush(api)
+                pcall(SyncQueue.flush, api)
             else
-                SyncQueue.flush()
+                pcall(SyncQueue.flush)
             end
         end
-        if isLifecycleCooldown() and UIManager and UIManager.scheduleIn then
-            local delay = math.max(0.5, (_resume_cooldown_until - os.time()) + 0.5)
-            UIManager:scheduleIn(delay, doFlush)
-        else
-            doFlush()
+        if isLifecycleCooldown() then
+            if UIManager and UIManager.scheduleIn then
+                local delay = math.max(0.5, (_resume_cooldown_until - os.time()) + 0.5)
+                UIManager:scheduleIn(delay, doFlush)
+            end
+            return
         end
+        doFlush()
         if orig_net then
             return orig_net(self_k, ...)
         end
@@ -1462,10 +1573,21 @@ local function hookLifecycleEvents(target)
         local fn_name = type(target.onSuspend) == "function" and "onSuspend" or "_onSuspend"
         local orig_suspend = target[fn_name]
         target[fn_name] = function(self_t, ...)
+            if self_t and self_t._bridge_resume_timer and UIManager and UIManager.unschedule then
+                pcall(UIManager.unschedule, UIManager, self_t._bridge_resume_timer)
+                self_t._bridge_resume_timer = nil
+            end
+            if self_t and self_t.sync and self_t.sync.flushDebouncedProgress then
+                pcall(self_t.sync.flushDebouncedProgress, self_t.sync)
+            end
             _suspend_in_progress = true
-            -- Note: KOSync:_onSuspend calls updateProgress(true, false, true);
-            -- setting _suspend_in_progress ensures Komga pushes enqueue to disk instead of blocking ALooper.
-            return orig_suspend(self_t, ...)
+            _suspend_started_at = os.time()
+            local ok_s, res = pcall(orig_suspend, self_t, ...)
+            if not ok_s then
+                _suspend_in_progress = false
+                error(res)
+            end
+            return res
         end
     end
 
@@ -1475,12 +1597,25 @@ local function hookLifecycleEvents(target)
         target[fn_name] = function(self_t, ...)
             _suspend_in_progress = false
             _resume_cooldown_until = os.time() + 3
+            if self_t and self_t._bridge_resume_timer and UIManager and UIManager.unschedule then
+                pcall(UIManager.unschedule, UIManager, self_t._bridge_resume_timer)
+                self_t._bridge_resume_timer = nil
+            end
             local args = { ... }
+            local n_args = select("#", ...)
             if UIManager and UIManager.scheduleIn then
                 -- Defer resume network syncs past the 3s cooldown so MainActivity.onResume/surfaceCreated never wait on sockets
-                UIManager:scheduleIn(3.1, function()
-                    pcall(orig_resume, self_t, unpack(args))
-                end)
+                local timer_fn
+                timer_fn = function()
+                    if self_t then self_t._bridge_resume_timer = nil end
+                    if _suspend_in_progress then return end
+                    local ok_r, err_r = pcall(orig_resume, self_t, unpack(args, 1, n_args))
+                    if not ok_r then
+                        logger.warn("[Bridge] Deferred onResume error:", tostring(err_r))
+                    end
+                end
+                if self_t then self_t._bridge_resume_timer = timer_fn end
+                UIManager:scheduleIn(3.1, timer_fn)
                 return
             end
             return orig_resume(self_t, ...)
@@ -1516,9 +1651,8 @@ function M.patchKokomgaSync()
     local komga = getKomgaPlugin()
     if komga then
         hookOnNetworkConnected(komga)
-        hookOnNetworkConnected(getmetatable(komga))
         hookOnCloseDocument(komga)
-        hookOnCloseDocument(getmetatable(komga))
+        hookLifecycleEvents(komga)
         if komga.sync then
             patchSyncTarget(komga.sync)
             patchSyncTarget(getmetatable(komga.sync))
@@ -1530,9 +1664,8 @@ function M.patchKokomgaSync()
     local proto = loaded and loaded["kokomga"]
     if proto then
         hookOnNetworkConnected(proto)
-        hookOnNetworkConnected(getmetatable(proto))
+        hookOnCloseDocument(proto)
         hookLifecycleEvents(proto)
-        hookLifecycleEvents(getmetatable(proto))
         if proto.sync then
             patchSyncTarget(proto.sync)
             patchSyncTarget(getmetatable(proto.sync))
@@ -1543,6 +1676,7 @@ function M.patchKokomgaSync()
             proto.init = function(self_k, ...)
                 orig_init(self_k, ...)
                 hookOnNetworkConnected(self_k)
+                hookOnCloseDocument(self_k)
                 hookLifecycleEvents(self_k)
                 if self_k.sync then
                     patchSyncTarget(self_k.sync)
@@ -1555,12 +1689,16 @@ function M.patchKokomgaSync()
     local kosync = loaded and loaded["kosync"]
     if kosync then
         hookLifecycleEvents(kosync)
-        hookLifecycleEvents(getmetatable(kosync))
     end
 end
 
 function M.onSuspend()
+    local komga = getKomgaPlugin()
+    if komga and komga.sync and komga.sync.flushDebouncedProgress then
+        pcall(komga.sync.flushDebouncedProgress, komga.sync)
+    end
     _suspend_in_progress = true
+    _suspend_started_at = os.time()
 end
 
 function M.onResume()
@@ -1579,14 +1717,21 @@ function M.installAll(profiles_mod)
     M.patchKokomgaAutoRtl()
     M.patchKokomgaSync()
     if UIManager and UIManager.nextTick then
-        -- Re-run once after all plugins finish init so late-loaded plugins (e.g. kosync) are hooked
+        -- Re-run once after all plugins finish init so late-loaded plugins (kokomga, bookshelf, kosync) are hooked
         UIManager:nextTick(function()
             Health.patchNetworkMgrOnline()
+            hookBookshelfRegister()
+            hookSourcesChanged()
+            M.patchBookshelfSettings(profiles_mod)
+            M.patchKokomgaMenu(profiles_mod)
+            M.enhanceKomgaShelfSource(profiles_mod)
+            M.patchKomgaApi()
+            M.patchKokomgaAutoRtl()
+            M.patchKokomgaSync()
             local ok_p, PluginLoader = pcall(require, "pluginloader")
             local loaded = ok_p and PluginLoader and PluginLoader.loaded_plugins or nil
             if loaded and loaded["kosync"] then
                 hookLifecycleEvents(loaded["kosync"])
-                hookLifecycleEvents(getmetatable(loaded["kosync"]))
             end
         end)
     end

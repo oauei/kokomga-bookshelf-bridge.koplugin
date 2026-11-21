@@ -10,33 +10,64 @@ local _ = require("gettext")
 
 local M = {}
 
+local MAX_CUSTOM_META_BYTES = 65536
+
+local function validateKomgaId(id)
+    if type(id) == "number" then
+        id = tostring(id)
+    end
+    if type(id) == "string" and #id > 0 and #id <= 128 and id:match("^[%w%-_]+$") then
+        return id
+    end
+    return nil
+end
+
 local function getKomgaPlugin()
+    local ok_mp, MenuPatch = pcall(require, "lib/bridge_menu_patch")
+    if ok_mp and type(MenuPatch) == "table" and type(MenuPatch.getKomgaPlugin) == "function" then
+        local ok_k, k = pcall(MenuPatch.getKomgaPlugin)
+        if ok_k and type(k) == "table" then
+            return k
+        end
+    end
     local ok_p, PluginLoader = pcall(require, "pluginloader")
     local loaded = ok_p and PluginLoader and PluginLoader.loaded_plugins or nil
-    return loaded and loaded["kokomga"] or nil
+    local p = loaded and loaded["kokomga"] or nil
+    return type(p) == "table" and p or nil
 end
 
 local function loadCustomMetadata(fp)
+    if type(fp) ~= "string" or fp == "" then return nil end
     local sdr1 = fp:gsub("%.%w+$", "") .. ".sdr/custom_metadata.lua"
     local sdr2 = fp .. ".sdr/custom_metadata.lua"
     for _, spath in ipairs({ sdr1, sdr2 }) do
         local f = io.open(spath, "r")
         if f then
+            local size = f:seek("end")
             f:close()
-            local func = loadfile(spath)
-            if func then
-                local ok, data = pcall(func)
-                if ok and type(data) == "table" then
-                    local id = data.komga_book_id or data.komga_id
-                    if not id and type(data.custom_props) == "table" then
-                        id = data.custom_props.komga_book_id or data.custom_props.komga_id
+            if size and size > 0 and size <= MAX_CUSTOM_META_BYTES then
+                local env = {}
+                local func, load_err = loadfile(spath, "t", env)
+                if func then
+                    if setfenv then
+                        pcall(setfenv, func, env)
                     end
-                    if not id and type(data.doc_props) == "table" then
-                        id = data.doc_props.komga_book_id or data.doc_props.komga_id
+                    local ok, data = pcall(func)
+                    if ok and type(data) == "table" then
+                        local id = data.komga_book_id or data.komga_id
+                        if not id and type(data.custom_props) == "table" then
+                            id = data.custom_props.komga_book_id or data.custom_props.komga_id
+                        end
+                        if not id and type(data.doc_props) == "table" then
+                            id = data.doc_props.komga_book_id or data.doc_props.komga_id
+                        end
+                        local valid_id = validateKomgaId(id)
+                        if valid_id then
+                            return valid_id
+                        end
                     end
-                    if id and id ~= "" then
-                        return tostring(id)
-                    end
+                else
+                    logger.dbg("[Bridge Linker] Rejected custom_metadata.lua:", tostring(load_err))
                 end
             end
         end
@@ -70,8 +101,9 @@ local function loadDocSettingsMetadata(fp)
                     id = dp.komga_book_id or dp.komga_id
                 end
             end
-            if id and id ~= "" then
-                return tostring(id)
+            local valid_id = validateKomgaId(id)
+            if valid_id then
+                return valid_id
             end
         end
     end
@@ -84,36 +116,41 @@ function M.collectKomgaBooks()
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
 
     local function isFile(p)
-        if not ok_lfs or not lfs then return true end
+        if type(p) ~= "string" or p == "" then return false end
+        if not ok_lfs or not lfs or not lfs.attributes then return false end
         local ok, attr = pcall(lfs.attributes, p, "mode")
         return ok and attr == "file"
     end
 
     -- 1. Check kokomga.settings.matched_books_cache
-    if komga and komga.settings and type(komga.settings.matched_books_cache) == "table" then
+    if komga and type(komga.settings) == "table" and type(komga.settings.matched_books_cache) == "table" then
         for fp, id in pairs(komga.settings.matched_books_cache) do
-            if type(fp) == "string" and type(id) == "string" and id ~= "" then
+            local valid_id = validateKomgaId(id)
+            if type(fp) == "string" and valid_id then
                 if isFile(fp) then
-                    books[fp] = tostring(id)
+                    books[fp] = valid_id
                 end
             end
         end
     end
 
-    -- 2. Check Bookshelf library filepaths for .sdr metadata (scoped to Komga download dir)
+    -- 2. Check Bookshelf library filepaths for .sdr metadata (strictly scoped to Komga download dir)
     local ok_r, Repo = pcall(require, "lib/bookshelf_book_repository")
-    if ok_r and Repo and Repo.getAllFilepaths then
-        local filepaths = Repo.getAllFilepaths() or {}
-        local komga_dl = komga and komga.getDownloadDir and komga:getDownloadDir()
-        local dl_prefix = type(komga_dl) == "string" and (komga_dl:gsub("/+$", "") .. "/") or nil
-
-        for _, fp in ipairs(filepaths) do
-            if not books[fp] and (not dl_prefix or fp:sub(1, #dl_prefix) == dl_prefix) and isFile(fp) then
-                local meta_id = loadDocSettingsMetadata(fp) or loadCustomMetadata(fp)
-                if meta_id and meta_id ~= "" then
-                    books[fp] = tostring(meta_id)
-                    if komga and komga.settings and type(komga.settings.matched_books_cache) == "table" then
-                        komga.settings.matched_books_cache[fp] = tostring(meta_id)
+    if ok_r and Repo and Repo.getAllFilepaths and komga and type(komga.getDownloadDir) == "function" then
+        local ok_dl, komga_dl = pcall(komga.getDownloadDir, komga)
+        local stripped = (ok_dl and type(komga_dl) == "string") and komga_dl:gsub("/+$", "") or nil
+        local dl_prefix = (stripped and #stripped > 1) and (stripped .. "/") or nil
+        if dl_prefix then
+            local ok_fps, filepaths = pcall(Repo.getAllFilepaths)
+            filepaths = (ok_fps and type(filepaths) == "table") and filepaths or {}
+            for _, fp in ipairs(filepaths) do
+                if type(fp) == "string" and not books[fp] and fp:sub(1, #dl_prefix) == dl_prefix and isFile(fp) then
+                    local meta_id = loadDocSettingsMetadata(fp) or loadCustomMetadata(fp)
+                    if meta_id then
+                        books[fp] = meta_id
+                        if type(komga.settings) == "table" and type(komga.settings.matched_books_cache) == "table" then
+                            komga.settings.matched_books_cache[fp] = meta_id
+                        end
                     end
                 end
             end
@@ -124,7 +161,7 @@ function M.collectKomgaBooks()
 end
 
 function M.executeLink(server)
-    if not server or not server.key then return end
+    if type(server) ~= "table" or type(server.key) ~= "string" or server.key == "" then return end
     local komga = getKomgaPlugin()
     if not komga then
         UIManager:show(Notification:new{ text = _("kokomga plugin is not loaded.") })
@@ -136,7 +173,10 @@ function M.executeLink(server)
 
     local to_link = {}
     for fp, id in pairs(books) do
-        to_link[#to_link + 1] = { path = fp, id = id }
+        local valid_id = validateKomgaId(id)
+        if valid_id then
+            to_link[#to_link + 1] = { path = fp, id = valid_id }
+        end
     end
 
     if #to_link == 0 then
@@ -145,25 +185,33 @@ function M.executeLink(server)
     end
 
     -- 1. Update kokomga settings
+    if type(komga.settings) ~= "table" then
+        komga.settings = {}
+    end
     komga.settings.opds_book_sources = komga.settings.opds_book_sources or {}
     for _, item in ipairs(to_link) do
-        komga.settings.opds_book_sources[tostring(item.id)] = server_key
+        komga.settings.opds_book_sources[item.id] = server_key
     end
-    if komga.saveSettings then komga:saveSettings() end
+    if type(komga.saveSettings) == "function" then
+        pcall(komga.saveSettings, komga)
+    end
 
     -- 2. Update kokomga_opds_downloads.lua
     local ok_ls, LuaSettings = pcall(require, "luasettings")
-    if ok_ls and LuaSettings and komga.getOpdsDownloadsPath then
-        local ok_f, kokomga_dl = pcall(LuaSettings.open, LuaSettings, komga:getOpdsDownloadsPath())
-        if ok_f and kokomga_dl then
-            local downloads = kokomga_dl:readSetting("downloads")
-            if type(downloads) ~= "table" then downloads = {} end
-            for _, item in ipairs(to_link) do
-                local opds_path = "OPDS://" .. server_key .. "/" .. tostring(item.id)
-                downloads[opds_path] = item.path
+    if ok_ls and LuaSettings and type(komga.getOpdsDownloadsPath) == "function" then
+        local ok_p, dl_path = pcall(komga.getOpdsDownloadsPath, komga)
+        if ok_p and type(dl_path) == "string" and dl_path ~= "" then
+            local ok_f, kokomga_dl = pcall(LuaSettings.open, LuaSettings, dl_path)
+            if ok_f and kokomga_dl then
+                local downloads = kokomga_dl:readSetting("downloads")
+                if type(downloads) ~= "table" then downloads = {} end
+                for _, item in ipairs(to_link) do
+                    local opds_path = "OPDS://" .. server_key .. "/" .. item.id
+                    downloads[opds_path] = item.path
+                end
+                kokomga_dl:saveSetting("downloads", downloads)
+                kokomga_dl:flush()
             end
-            kokomga_dl:saveSetting("downloads", downloads)
-            kokomga_dl:flush()
         end
     end
 
@@ -172,11 +220,11 @@ function M.executeLink(server)
     local ok_bs, BookshelfSettings = pcall(require, "lib/bookshelf_settings_store")
     if ok_bs and BookshelfSettings and BookshelfSettings.read then
         local ok_dl, OpdsDownload = pcall(require, "lib/bookshelf_opds_download")
-        local dl_key = ok_dl and OpdsDownload.STORE_KEY or "opds_downloads"
+        local dl_key = (ok_dl and type(OpdsDownload) == "table" and OpdsDownload.STORE_KEY) or "opds_downloads"
         local map = BookshelfSettings.read(dl_key)
         if type(map) ~= "table" then map = {} end
         for _, item in ipairs(to_link) do
-            local opds_path = "OPDS://" .. server_key .. "/" .. tostring(item.id)
+            local opds_path = "OPDS://" .. server_key .. "/" .. item.id
             if not map[opds_path] then
                 newly_linked = newly_linked + 1
             end
@@ -226,8 +274,12 @@ function M.linkKomgaBooksPrompt(profiles_mod)
         return
     end
 
-    local matched, all_servers = profiles_mod.findServers()
-    if not all_servers or #all_servers == 0 then
+    if type(profiles_mod) ~= "table" or type(profiles_mod.findServers) ~= "function" then
+        UIManager:show(Notification:new{ text = _("No OPDS servers configured in KOReader.") })
+        return
+    end
+    local ok_fs, matched, all_servers = pcall(profiles_mod.findServers)
+    if not ok_fs or not all_servers or #all_servers == 0 then
         UIManager:show(Notification:new{ text = _("No OPDS servers configured in KOReader.") })
         return
     end

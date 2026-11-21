@@ -18,6 +18,30 @@ function M.isEnabled()
     return true
 end
 
+local function countWordsInPageText(txt)
+    if type(txt) == "string" then
+        local _, count = txt:gsub("%S+", "")
+        return count
+    elseif type(txt) == "table" then
+        local count = 0
+        for _, line in ipairs(txt) do
+            if type(line) == "table" then
+                if #line > 0 then
+                    count = count + #line
+                elseif type(line.text) == "string" then
+                    local _, c = line.text:gsub("%S+", "")
+                    count = count + c
+                end
+            elseif type(line) == "string" then
+                local _, c = line:gsub("%S+", "")
+                count = count + c
+            end
+        end
+        return count
+    end
+    return 0
+end
+
 local function isTextPdf(document)
     if not document then return false end
     local ok_f, file = pcall(function() return document.file end)
@@ -29,9 +53,20 @@ local function isTextPdf(document)
         if ok_t and has_t then return true end
     end
     if type(document.getPageText) == "function" then
-        local ok_p, txt = pcall(document.getPageText, document, 1)
-        if ok_p and type(txt) == "string" and #txt:gsub("%s+", "") > 20 then
-            return true
+        local total_pages = 1
+        if type(document.getPageCount) == "function" then
+            local ok_c, cnt = pcall(document.getPageCount, document)
+            if ok_c and tonumber(cnt) and tonumber(cnt) > 0 then
+                total_pages = math.floor(tonumber(cnt))
+            end
+        end
+        for _, p in ipairs({ 1, 2, 3, 5 }) do
+            if p <= total_pages then
+                local ok_p, txt = pcall(document.getPageText, document, p)
+                if ok_p and countWordsInPageText(txt) > 20 then
+                    return true
+                end
+            end
         end
     end
     return false
@@ -97,22 +132,29 @@ function M.applyIfNeeded(ui)
     if not (ui and ui.view and ui.document) then return false end
 
     local doc_settings = ui.doc_settings
-    if doc_settings and doc_settings.readSetting and doc_settings:readSetting("bridge_long_strip_version") == M.APPLY_VERSION then
-        return false
+    if doc_settings and type(doc_settings.readSetting) == "function" then
+        local ok_ver, ver = pcall(doc_settings.readSetting, doc_settings, "bridge_long_strip_version")
+        if ok_ver and ver == M.APPLY_VERSION then
+            return false
+        end
     end
 
-    if not M.isLongStripDocument(ui.document, ui.document.file) then
+    local ok_fp, doc_file = pcall(function() return ui.document.file end)
+    doc_file = ok_fp and doc_file or nil
+    if not M.isLongStripDocument(ui.document, doc_file) then
         return false
     end
 
     logger.info("[Bridge LongStrip] Detected long-strip comic; applying contentwidth + SetScrollMode(true) + RTL preserved: "
-        .. tostring(ui.document.file))
+        .. tostring(doc_file))
 
     local ok_ev, Event = pcall(require, "ui/event")
     local function sendEvent(name, ...)
         if ok_ev and Event and ui.handleEvent then
-            pcall(ui.handleEvent, ui, Event:new(name, ...))
+            local ok_h = pcall(ui.handleEvent, ui, Event:new(name, ...))
+            return ok_h
         end
+        return false
     end
 
     -- 1. Switch zoom mode to fit content width BEFORE enabling scroll mode
@@ -120,10 +162,14 @@ function M.applyIfNeeded(ui)
     sendEvent("SetZoomMode", "contentwidth")
 
     -- 2. Enable continuous vertical scroll mode
+    local scroll_applied = false
     if type(ui.document.configurable) == "table" then
         ui.document.configurable.page_scroll = 1
+        scroll_applied = true
     end
-    sendEvent("SetScrollMode", true)
+    if sendEvent("SetScrollMode", true) then
+        scroll_applied = true
+    end
 
     -- 3. Refresh touch zones after enabling scroll mode (preserving RTL/LTR reading order)
     if type(ui.view.setupTouchZones) == "function" then
@@ -132,8 +178,8 @@ function M.applyIfNeeded(ui)
         pcall(ui.paging.setupTouchZones, ui.paging)
     end
 
-    -- 4. Persist settings and one-time versioned per-book marker
-    if doc_settings and doc_settings.saveSetting then
+    -- 4. Persist settings and one-time versioned per-book marker (only when scroll mode applied)
+    if scroll_applied and doc_settings and doc_settings.saveSetting then
         pcall(doc_settings.saveSetting, doc_settings, "kopt_page_scroll", 1)
         pcall(doc_settings.saveSetting, doc_settings, "zoom_mode", "contentwidth")
         pcall(doc_settings.saveSetting, doc_settings, "normal_zoom_mode", "contentwidth")

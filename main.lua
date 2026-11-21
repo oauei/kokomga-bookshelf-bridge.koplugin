@@ -52,7 +52,17 @@ function BridgePlugin:onKomgaSwitchNetwork()
 end
 
 function BridgePlugin:onReaderReady()
+    MenuPatch.patchKokomgaMenu(Profiles)
+    MenuPatch.patchKomgaApi()
     MenuPatch.patchKokomgaAutoRtl()
+    MenuPatch.patchKokomgaSync()
+end
+
+function BridgePlugin:onCloseDocument()
+    local komga = MenuPatch.getKomgaPlugin and MenuPatch.getKomgaPlugin()
+    if komga and komga.sync and komga.sync.flushDebouncedProgress then
+        pcall(komga.sync.flushDebouncedProgress, komga.sync)
+    end
 end
 
 function BridgePlugin:onSuspend()
